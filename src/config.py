@@ -1,0 +1,134 @@
+# =============================================================================
+# config.py — Cấu hình Hyperparameters & Kiến trúc SWFT
+# =============================================================================
+# Tất cả hyperparameters được thiết kế dựa trên các bài báo peer-reviewed:
+#   - Kiến trúc Transformer: Vaswani et al., "Attention Is All You Need", NeurIPS 2017
+#   - BERT config tham khảo: Devlin et al., NAACL 2019
+#   - Factorized Embedding: Lan et al., "ALBERT", ICLR 2020
+#   - Pre-LN: Xiong et al., "On Layer Normalization in the Transformer Architecture", ICML 2020
+#   - Xavier Init: Glorot & Bengio, "Understanding the difficulty of training deep feedforward neural networks", AISTATS 2010
+#   - Cosine Annealing: Loshchilov & Hutter, "SGDR: Stochastic Gradient Descent with Warm Restarts", ICLR 2017
+#   - Dropout as Augmentation: Gao et al., "SimCSE", EMNLP 2021
+#   - AdamW: Loshchilov & Hutter, "Decoupled Weight Decay Regularization", ICLR 2019
+# =============================================================================
+
+import os
+import torch
+
+
+def get_device():
+    """
+    Tự động xác định device phù hợp.
+    MPS (Apple Silicon) dùng để debug, CUDA (H100) dùng để train chính thức.
+    Tham khảo: Mục 12 trong document_similarity_research.md
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+# =============================================================================
+# CẤU HÌNH MÔ HÌNH (SWFT — Shallow-Wide Factorized Transformer)
+# =============================================================================
+# Triết lý: Không phải bản thu nhỏ của BERT. Là kiến trúc thiết kế lại từ gốc.
+# - Shallow (6 layers) → giảm FLOPs tuần tự, tiết kiệm compute
+# - Wide (768d) → giữ sức mạnh biểu diễn ngữ nghĩa
+# - Factorized Embedding (128→768) → tiết kiệm ~19M tham số (ALBERT, ICLR 2020)
+
+MODEL_CONFIG = {
+    # --- Embedding ---
+    "vocab_size": 30_522,          # WordPiece vocab (BERT tokenizer) — Devlin et al., NAACL 2019
+    "embedding_dim": 128,          # E = 128 (factorized, nhỏ) — Lan et al., ALBERT, ICLR 2020
+    "hidden_size": 768,            # H = 768 (projection target, lớn) — giữ sức biểu diễn
+    "max_seq_length": 128,         # Đủ cho sentence-level similarity
+
+    # --- Transformer Encoder ---
+    "num_layers": 6,               # Shallow: 6 layers thay vì 12 — giảm FLOPs 2x
+    "num_heads": 12,               # 12 heads, mỗi head d_k = 768/12 = 64 — Vaswani et al., NeurIPS 2017
+    "ffn_hidden_size": 3072,       # 4 × d_model = 3072 — tỷ lệ chuẩn Transformer
+    "dropout": 0.1,                # Dropout cũng đóng vai trò Data Augmentation — SimCSE, EMNLP 2021
+    "layer_norm_eps": 1e-12,       # Epsilon cho LayerNorm — theo BERT
+
+    # --- Positional Encoding ---
+    "position_encoding": "sinusoidal",  # Không thêm tham số, generalize tốt — Vaswani et al., NeurIPS 2017
+
+    # --- Normalization ---
+    "norm_type": "pre_ln",         # Pre-LN — Xiong et al., ICML 2020: ổn định gradient, giảm warmup
+}
+
+# =============================================================================
+# CẤU HÌNH HUẤN LUYỆN
+# =============================================================================
+
+TRAIN_CONFIG = {
+    # --- Optimizer: AdamW ---
+    # Loshchilov & Hutter, "Decoupled Weight Decay Regularization", ICLR 2019
+    "learning_rate": 5e-4,         # Cao hơn fine-tune (2e-5) vì train from scratch
+    "weight_decay": 0.01,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.999,
+    "adam_epsilon": 1e-8,
+
+    # --- Learning Rate Schedule ---
+    # Loshchilov & Hutter, "SGDR", ICLR 2017
+    "scheduler": "cosine",         # Cosine Annealing — hội tụ tốt hơn linear decay
+    "warmup_ratio": 0.1,           # 10% tổng steps — Vaswani et al., NeurIPS 2017
+
+    # --- Batch Size ---
+    "batch_size_debug": 8,         # Nhỏ cho MPS debug
+    "batch_size_train": 64,        # Per-GPU trên H100 80GB VRAM
+    "gradient_accumulation_steps": 4,  # Effective batch = 64 × 4 = 256
+
+    # --- Epochs ---
+    "epochs_stage0": 1,            # Stage 0: Unsupervised SimCSE trên Wikipedia (1 epoch đủ cho 20GB)
+    "epochs_stage1": 4,            # Stage 1: NLI fine-tune
+    "epochs_stage2": 4,            # Stage 2: Similarity fine-tune
+
+    # --- MNR Loss ---
+    # Henderson et al., 2017 — Multiple Negatives Ranking
+    "temperature": 0.05,           # Scale cosine similarity trong MNR Loss
+
+    # --- Mixed Precision ---
+    "use_amp_on_cuda": True,       # FP16 trên CUDA — tiết kiệm VRAM & tăng tốc
+    "use_amp_on_mps": False,       # FP32 trên MPS — AMP chưa ổn định trên Apple Silicon
+
+    # --- Checkpoint ---
+    "checkpoint_dir": os.environ.get("SWFT_CHECKPOINT_DIR", "./checkpoints"),
+    "save_every_epoch": True,      # Lưu checkpoint mỗi epoch — BẮT BUỘC cho resume
+
+    # --- Data Cache (Pre-tokenized, Apache Arrow) ---
+    "data_cache_dir": os.environ.get("SWFT_CACHE_DIR", "./data_cache"),
+}
+
+# =============================================================================
+# CẤU HÌNH DEBUG
+# =============================================================================
+
+DEBUG_CONFIG = {
+    "enabled": True,               # True = debug trên MPS, False = train chính thức trên H100
+    "num_samples": 3000,           # Số lượng samples debug (nhỏ để chạy nhanh)
+    "eval_samples": 500,           # Số lượng samples eval debug
+}
+
+# =============================================================================
+# ĐƯỜNG DẪN DỮ LIỆU
+# =============================================================================
+
+DATA_CONFIG = {
+    # Dataset NLI — Bowman et al., EMNLP 2015 + Williams et al., NAACL 2018
+    "nli_dataset": "stanfordnlp/snli",
+
+    # Dataset Evaluation — Cer et al., SemEval@ACL 2017
+    "stsb_dataset": "mteb/stsbenchmark-sts",
+
+    # Dataset QQP — Wang et al., GLUE, ICLR 2019
+    "qqp_dataset": "google-research-datasets/paws",   # Dùng PAWS vì đã tải
+
+    # Dataset PAWS (Hard Negatives) — Zhang et al., NAACL 2019
+    "paws_dataset": "google-research-datasets/paws",
+
+    # Tokenizer — Devlin et al., NAACL 2019
+    "tokenizer_name": "bert-base-uncased",
+}

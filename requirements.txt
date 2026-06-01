@@ -1,0 +1,19 @@
+# Core
+torch
+numpy
+
+# Tokenizer only (không dùng model của HuggingFace)
+transformers
+
+# Dataset loading
+datasets
+
+# Evaluation
+scikit-learn
+scipy
+
+# BM25 Baseline
+rank_bm25
+
+# Training support
+accelerate>=1.1.0
