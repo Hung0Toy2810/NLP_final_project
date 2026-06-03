@@ -2,8 +2,11 @@
 torch
 numpy
 
-# Tokenizer only (không dùng model của HuggingFace)
+# HuggingFace tokenizer/model utilities
 transformers
+
+# Optional Stage 0 teacher-student distillation
+sentence-transformers
 
 # Dataset loading
 datasets

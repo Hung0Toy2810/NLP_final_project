@@ -11,7 +11,7 @@
 #   4. Khi train, DataLoader chỉ đọc mảng số — GPU không phải chờ CPU
 #
 # Bài báo tham khảo:
-#   [1] Gao et al., "SimCSE", EMNLP 2021 — Unsupervised SimCSE dùng Wikipedia
+#   [1] Reimers & Gurevych, EMNLP 2020 — teacher-student distillation
 #   [2] Bowman et al., EMNLP 2015 — SNLI dataset
 #   [3] Zhang et al., NAACL 2019 — PAWS dataset
 #   [4] Cer et al., SemEval@ACL 2017 — STS Benchmark
@@ -54,11 +54,10 @@ def get_num_proc():
 
 
 # =============================================================================
-# 1. WIKIPEDIA — cho Stage 0 (Unsupervised SimCSE)
+# 1. WIKIPEDIA — cho Stage 0 (Teacher-Student Distillation)
 # =============================================================================
-# Gao et al., "SimCSE", EMNLP 2021:
-#   "We simply take a collection of sentences from Wikipedia
-#    and use the InfoNCE loss with in-batch negatives."
+# Reimers & Gurevych, EMNLP 2020:
+#   student sentence encoder học mimic embedding space của teacher.
 # =============================================================================
 
 def prepare_wikipedia(tokenizer, cache_dir: str, debug: bool = False):
@@ -76,7 +75,7 @@ def prepare_wikipedia(tokenizer, cache_dir: str, debug: bool = False):
         return
 
     logger.info("=" * 60)
-    logger.info("CHUẨN BỊ WIKIPEDIA (Stage 0 — SimCSE, Gao et al., EMNLP 2021)")
+    logger.info("CHUẨN BỊ WIKIPEDIA (Stage 0 — Teacher Distillation, EMNLP 2020)")
     logger.info("=" * 60)
 
     start = time.time()

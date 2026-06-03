@@ -11,11 +11,12 @@
 #   [2] Williams et al., "A Broad-Coverage Challenge Corpus for NLI", NAACL 2018 → MultiNLI
 #   [3] Zhang et al., "PAWS: Paraphrase Adversaries from Word Scrambling", NAACL 2019
 #   [4] Cer et al., "STS Benchmark", SemEval@ACL 2017
-#   [5] Gao et al., "SimCSE: Simple Contrastive Learning of Sentence Embeddings", EMNLP 2021
+#   [5] Reimers & Gurevych, "Making Monolingual Sentence Embeddings Multilingual
+#       using Knowledge Distillation", EMNLP 2020
 #
 # Chiến lược dữ liệu:
 #   [6] Bengio et al., "Curriculum Learning", ICML 2009
-#       → Stage 0 (SimCSE, dễ nhất) → Stage 1 (NLI, dễ) → Stage 2 (Similarity + HN, khó)
+#       → Stage 0 (teacher distillation) → Stage 1 (NLI) → Stage 2 (Similarity + HN)
 # =============================================================================
 
 import os
@@ -52,25 +53,21 @@ def get_tokenizer(tokenizer_name: str = "bert-base-uncased"):
 
 
 # =============================================================================
-# DATASET CHO GIAI ĐOẠN 0: UNSUPERVISED SimCSE (Wikipedia)
+# DATASET CHO GIAI ĐOẠN 0: TEACHER-STUDENT DISTILLATION (Wikipedia)
 # =============================================================================
-# Gao et al., "SimCSE", EMNLP 2021:
-#   "Unsupervised SimCSE simply takes an input sentence and predicts itself
-#    in a contrastive objective, with only standard dropout used as noise."
-#
 # Cách hoạt động:
-#   1. Mỗi sample chỉ có 1 câu (không cần cặp câu hay nhãn)
-#   2. Trong training loop, cùng 1 câu được encode 2 lần
-#   3. Do nn.Dropout(0.1) khác nhau mỗi lần forward → tạo ra 2 vector khác nhau
-#   4. Contrastive loss ép 2 vector (cùng 1 câu) lại gần nhau, đẩy câu khác ra xa
+#   1. Mỗi sample là 1 câu Wikipedia đã tokenize.
+#   2. Teacher all-mpnet-base-v2 sinh normalized 768d embedding cho câu đó.
+#   3. Student SWFT sinh 768d embedding từ cùng input_ids.
+#   4. Direct cosine distillation kéo student gần teacher.
 
-class WikipediaSimCSEDataset(Dataset):
+class WikipediaDistillationDataset(Dataset):
     """
-    Dataset cho Stage 0 — Unsupervised SimCSE trên Wikipedia.
-    Gao et al., EMNLP 2021.
+    Dataset cho Stage 0 — teacher-student distillation trên Wikipedia.
+    Reimers & Gurevych, EMNLP 2020.
 
-    Mỗi sample chỉ trả về input_ids và attention_mask của 1 câu.
-    Positive pair được tạo tự động nhờ Dropout trong training loop.
+    Mỗi sample trả về input_ids và attention_mask của 1 câu. Teacher target
+    được sinh trong training loop để không làm phình cache trên disk.
     """
 
     def __init__(self, cache_dir: Optional[str] = None, tokenizer=None,

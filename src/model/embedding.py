@@ -21,6 +21,7 @@
 import math
 import torch
 import torch.nn as nn
+from typing import cast
 
 
 class FactorizedEmbedding(nn.Module):
@@ -124,7 +125,8 @@ class SinusoidalPositionalEncoding(nn.Module):
             (batch_size, seq_len, d_model) — x + positional encoding
         """
         # Cộng PE vào input (broadcast theo batch dimension)
-        return x + self.pe[:, :x.size(1), :]
+        pe = cast(torch.Tensor, self.get_buffer('pe'))
+        return x + pe[:, :x.size(1), :]
 
 
 class TransformerEmbedding(nn.Module):

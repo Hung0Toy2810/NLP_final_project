@@ -23,6 +23,7 @@
 
 import torch
 import torch.nn as nn
+from typing import Optional
 from model.attention import MultiHeadSelfAttention
 
 
@@ -146,7 +147,7 @@ class PreLNEncoderBlock(nn.Module):
         # Dropout sau FFN (trước residual)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Pre-LN Encoder Block:
             x → LN → Attention → Dropout → + x (residual)
@@ -207,7 +208,7 @@ class TransformerEncoder(nn.Module):
         # Final LayerNorm — cần thiết cho Pre-LN architecture
         self.final_norm = nn.LayerNorm(d_model, eps=layer_norm_eps)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Đẩy input qua lần lượt từng Encoder Block.
 

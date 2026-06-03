@@ -1,5 +1,5 @@
 # =============================================================================
-# losses.py — SoftmaxLoss (NLI) + Contrastive Loss — Implement từ đầu
+# losses.py — SoftmaxLoss + Contrastive Loss + Teacher Distillation
 # =============================================================================
 # Implement 100% bằng PyTorch thuần (torch.nn.functional).
 #
@@ -13,7 +13,14 @@
 #       → Unsupervised: cùng input encode 2 lần bằng dropout
 #       → Supervised: entailment positives, contradiction hard negatives
 #
-#   [3] Glorot & Bengio, AISTATS 2010
+#   [3] Reimers & Gurevych, "Making Monolingual Sentence Embeddings
+#       Multilingual using Knowledge Distillation", EMNLP 2020
+#       → Student sentence encoder học bắt chước embedding space của teacher
+#
+#   [4] TinyBERT, Findings EMNLP 2020 + MiniLM, NeurIPS 2020
+#       → Distillation là hướng hợp lệ để nén/tăng tốc Transformer student
+#
+#   [5] Glorot & Bengio, AISTATS 2010
 #       → Xavier Init cho Linear layers trong SoftmaxLoss
 # =============================================================================
 
@@ -179,3 +186,45 @@ class MultipleNegativesRankingLoss(nn.Module):
         loss = F.cross_entropy(similarity_matrix, labels)
 
         return loss
+
+
+class Stage0TeacherDistillationLoss(nn.Module):
+    """
+    Direct teacher-student distillation cho Stage 0 sentence embeddings.
+
+    Teacher được xem như ground truth embedding space:
+        - Teacher chạy eval/no_grad ở training loop.
+        - Student là nhánh duy nhất nhận gradient.
+        - Cả student và teacher đều được L2-normalize.
+        - Loss = 1 - cosine(student, teacher).
+
+    Loss này cố ý yêu cầu teacher_dim == student_dim. Nếu muốn student 768d học
+    trực tiếp vector teacher thì teacher cũng phải xuất 768d, ví dụ
+    sentence-transformers/all-mpnet-base-v2.
+
+    Cơ sở:
+        - Reimers & Gurevych, EMNLP 2020: student sentence embedding model học
+          mimic embedding space từ teacher.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, student_embeddings: torch.Tensor,
+                teacher_embeddings: torch.Tensor) -> torch.Tensor:
+        if student_embeddings.size(0) != teacher_embeddings.size(0):
+            raise ValueError(
+                "student_embeddings và teacher_embeddings phải có cùng batch_size "
+                f"({student_embeddings.size(0)} != {teacher_embeddings.size(0)})"
+            )
+        if student_embeddings.size(-1) != teacher_embeddings.size(-1):
+            raise ValueError(
+                "Direct Stage 0 distillation yêu cầu student_dim == teacher_dim "
+                f"({student_embeddings.size(-1)} != {teacher_embeddings.size(-1)}). "
+                "Hãy dùng teacher 768d, ví dụ sentence-transformers/all-mpnet-base-v2."
+            )
+
+        student = F.normalize(student_embeddings.float(), p=2, dim=-1)
+        teacher = F.normalize(teacher_embeddings.detach().float(), p=2, dim=-1)
+        cosine = (student * teacher).sum(dim=-1)
+        return 1.0 - cosine.mean()

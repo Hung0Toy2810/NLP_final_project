@@ -5,7 +5,7 @@
 # Mọi bước đều minh bạch: zero_grad → forward → loss → backward → step.
 #
 # Curriculum Learning Pipeline (Bengio et al., ICML 2009):
-#   Stage 0: Unsupervised SimCSE trên Wikipedia (Gao et al., EMNLP 2021)
+#   Stage 0: Supervised teacher-student distillation trên Wikipedia
 #   Stage 1: NLI SoftmaxLoss (Reimers & Gurevych, EMNLP 2019)
 #   Stage 2: Contrastive softmax + Hard Negatives trên PAWS (Zhang et al., NAACL 2019)
 #
@@ -16,6 +16,7 @@
 #   [4] Loshchilov & Hutter, ICLR 2019 — AdamW Optimizer
 #   [5] Vaswani et al., NeurIPS 2017 — Linear Warmup
 #   [6] Gao et al., EMNLP 2021 — SimCSE: Dropout as Data Augmentation
+#   [7] Reimers & Gurevych, EMNLP 2020 — Sentence Embedding Distillation
 # =============================================================================
 
 import os
@@ -34,9 +35,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import MODEL_CONFIG, TRAIN_CONFIG, DEBUG_CONFIG, DATA_CONFIG, get_device
 from model.sbert import create_swft_model
-from losses import SoftmaxLoss, MultipleNegativesRankingLoss
+from losses import (
+    SoftmaxLoss, MultipleNegativesRankingLoss, Stage0TeacherDistillationLoss
+)
 from dataset import (
-    get_tokenizer, WikipediaSimCSEDataset, NLIDataset, SimilarityDataset,
+    get_tokenizer, WikipediaDistillationDataset, NLIDataset, SimilarityDataset,
     STSBDataset, create_dataloader
 )
 
@@ -242,6 +245,70 @@ def get_stage0_scheduler_steps(num_batches: int, accumulation_steps: int,
     return max(1, min(full_update_steps, expected_update_steps))
 
 
+def load_stage0_teacher(device):
+    """
+    Load SentenceTransformer teacher cho Stage 0 distillation.
+
+    Teacher không được train; nó chỉ sinh sentence embeddings làm mục tiêu mềm
+    cho student, theo Reimers & Gurevych, EMNLP 2020.
+    """
+    teacher_name = str(TRAIN_CONFIG.get("stage0_teacher_model"))
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:
+        raise RuntimeError(
+            "Stage 0 distillation cần package sentence-transformers. "
+            "Cài bằng: pip install sentence-transformers."
+        ) from exc
+
+    logger.info(f"[Stage0-KD] Loading teacher: {teacher_name}")
+    teacher = SentenceTransformer(teacher_name, device=str(device))
+    teacher.eval()
+    for parameter in teacher.parameters():
+        parameter.requires_grad_(False)
+
+    try:
+        teacher_dim = teacher.get_sentence_embedding_dimension()
+    except Exception:
+        teacher_dim = None
+    expected_dim = int(MODEL_CONFIG["hidden_size"])
+    if teacher_dim is not None and teacher_dim != expected_dim:
+        raise ValueError(
+            f"Stage 0 direct distillation yêu cầu teacher_dim == student_dim "
+            f"({teacher_dim} != {expected_dim}). "
+            "Hãy dùng teacher 768d, ví dụ sentence-transformers/all-mpnet-base-v2."
+        )
+    logger.info(f"[Stage0-KD] Teacher ready | dim={teacher_dim} | device={device}")
+    return teacher
+
+
+def encode_stage0_teacher_embeddings(teacher, tokenizer, input_ids, device):
+    """
+    Sinh teacher embeddings cho batch hiện tại.
+
+    Dùng batch_decode từ token ids đã có để không phải giữ raw text trong cache
+    và không làm phình network volume.
+    """
+    texts = tokenizer.batch_decode(
+        input_ids.detach().cpu().tolist(),
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=True,
+    )
+    teacher_batch_size = max(
+        1,
+        int(TRAIN_CONFIG.get("stage0_teacher_batch_size", len(texts)))
+    )
+    with torch.no_grad():
+        teacher_embeddings = teacher.encode(
+            texts,
+            batch_size=teacher_batch_size,
+            convert_to_tensor=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+    return teacher_embeddings.to(device=device, dtype=torch.float32)
+
+
 def log_progress(stage_name: str, epoch: int, epochs: int, global_step: int,
                  total_batch_steps: int, epoch_loss: float, num_batches: int,
                  stage_start_time: float, lr: float,
@@ -324,36 +391,30 @@ def _create_eval_loader(device, debug, cache_dir):
 
 
 # =============================================================================
-# GIAI ĐOẠN 0: UNSUPERVISED SimCSE (Wikipedia)
+# GIAI ĐOẠN 0: SUPERVISED TEACHER DISTILLATION
 # =============================================================================
-# Gao et al., "SimCSE: Simple Contrastive Learning of Sentence Embeddings",
-# EMNLP 2021.
+# Reimers & Gurevych, EMNLP 2020:
+#   Student sentence encoder học mimic embedding space của teacher.
 #
-# Ý tưởng cốt lõi (trích paper, Section 3.1):
-#   "We simply feed the same input sentence to the encoder TWICE and obtain
-#    two different embeddings as 'positive pairs', by applying independently
-#    sampled dropout masks."
-#
-# Giải thích chi tiết:
-#   1. Mỗi câu x đi vào mô hình 2 lần:
-#      h₁ = model(x)  ← Dropout mask lần 1 (ngẫu nhiên)
-#      h₂ = model(x)  ← Dropout mask lần 2 (ngẫu nhiên KHÁC)
-#   2. h₁ ≠ h₂ mặc dù input giống nhau (do Dropout khác nhau)
-#   3. Contrastive loss ép h₁ và h₂ lại gần nhau, đẩy các câu khác trong batch ra xa
-#   4. Kết quả: mô hình học được rằng "nội dung giống → embedding giống"
+# Trong pipeline này:
+#   1. Teacher all-mpnet-base-v2 sinh normalized 768d sentence embedding.
+#   2. Student SWFT sinh 768d sentence embedding từ cùng input.
+#   3. Loss = 1 - cosine(normalize(student), normalize(teacher)).
+#   4. Teacher chạy eval/no_grad; backward chỉ cập nhật student.
 
-def train_stage0_simcse(model, device, debug=True):
+def train_stage0_distillation(model, device, debug=True):
     """
-    Giai đoạn 0: Unsupervised SimCSE — Gao et al., EMNLP 2021.
+    Giai đoạn 0: supervised direct teacher-student distillation.
     Curriculum Learning Stage 0 (dễ nhất) — Bengio et al., ICML 2009.
 
     Mục tiêu: Học biểu diễn ngôn ngữ cơ bản từ text thô Wikipedia
-    Loss: contrastive softmax (cùng 1 câu encode 2 lần, Dropout tạo positive pair)
+    Supervisor: sentence-transformers/all-mpnet-base-v2
+    Loss: 1 - cosine(normalize(student), normalize(teacher))
     """
     logger.info("=" * 60)
-    logger.info("GIAI ĐOẠN 0: UNSUPERVISED SimCSE (Wikipedia)")
-    logger.info("Paper: Gao et al., EMNLP 2021 + Bengio et al., ICML 2009")
-    logger.info("Dropout as Data Augmentation — không cần nhãn!")
+    logger.info("GIAI ĐOẠN 0: SUPERVISED TEACHER DISTILLATION")
+    logger.info("Paper: Reimers & Gurevych, EMNLP 2020")
+    logger.info("Teacher target: normalized 768d sentence embedding; backward chỉ qua student")
     logger.info("=" * 60)
 
     cache_dir = TRAIN_CONFIG.get("data_cache_dir")
@@ -363,7 +424,7 @@ def train_stage0_simcse(model, device, debug=True):
 
     # Dataset
     stage0_max_samples = TRAIN_CONFIG.get("stage0_max_samples") or None
-    wiki_dataset = WikipediaSimCSEDataset(
+    wiki_dataset = WikipediaDistillationDataset(
         cache_dir=cache_dir,
         tokenizer=tokenizer,
         max_length=MODEL_CONFIG["max_seq_length"],
@@ -380,8 +441,16 @@ def train_stage0_simcse(model, device, debug=True):
     # Evaluation
     eval_loader = _create_eval_loader(device, debug, cache_dir)
 
-    # Loss — SimCSE-style contrastive softmax với in-batch negatives
-    criterion = MultipleNegativesRankingLoss(temperature=TRAIN_CONFIG["temperature"])
+    stage_log_name = "Stage0-distillation"
+
+    # Loss
+    teacher_model = load_stage0_teacher(device)
+    distillation_criterion = Stage0TeacherDistillationLoss()
+    logger.info(
+        "[Stage0-KD] Enabled | objective=distillation | teacher=%s | weight=%.3f",
+        TRAIN_CONFIG["stage0_teacher_model"],
+        TRAIN_CONFIG["stage0_distillation_weight"],
+    )
 
     # Optimizer — AdamW, Loshchilov & Hutter, ICLR 2019
     optimizer = AdamW(
@@ -421,7 +490,9 @@ def train_stage0_simcse(model, device, debug=True):
                 f"Scheduler optimizer steps: {total_steps}, Warmup: {warmup_steps}")
     logger.info(f"Batch size: {batch_size}, Grad accumulation: {accumulation_steps}, "
                 f"Optimizer effective batch: {batch_size * accumulation_steps}, "
-                f"Contrastive negatives per batch: {batch_size - 1}, AMP: {use_amp}, Device: {device}")
+                f"AMP: {use_amp}, Device: {device}")
+    logger.info(f"Direct KD teacher: {TRAIN_CONFIG['stage0_teacher_model']}")
+    logger.info("Stage0 objective: supervised distillation")
     if not debug:
         sample_cap_text = f"{stage0_max_samples:,}" if stage0_max_samples else "none"
         budget_text = format_duration(time_budget_seconds) if time_budget_seconds else "disabled"
@@ -443,7 +514,7 @@ def train_stage0_simcse(model, device, debug=True):
         for batch_idx, batch in enumerate(train_loader):
             elapsed = time.time() - stage_start_time
             if time_budget_seconds is not None and elapsed >= time_budget_seconds:
-                logger.info(f"[Stage0-SimCSE] Time budget reached after "
+                logger.info(f"[{stage_log_name}] Time budget reached after "
                             f"{format_duration(elapsed)} at step {global_step}.")
                 stop_stage0 = True
                 break
@@ -453,17 +524,18 @@ def train_stage0_simcse(model, device, debug=True):
 
             ids = batch['input_ids'].to(device)
             mask = batch['attention_mask'].to(device)
+            teacher_embeddings = encode_stage0_teacher_embeddings(
+                teacher_model, tokenizer, ids, device
+            )
 
             with autocast(device_type=device.type, enabled=use_amp):
-                # ===== CỐT LÕI CỦA SimCSE =====
-                # Cùng 1 input, encode 2 lần → Dropout khác nhau → 2 embeddings khác nhau
-                # (Gao et al., EMNLP 2021, Section 3.1)
                 model.train()  # Đảm bảo Dropout BẬT
-                embedding_1 = model(ids, mask)  # h₁ = f(x, z₁) với z₁ = dropout mask 1
-                embedding_2 = model(ids, mask)  # h₂ = f(x, z₂) với z₂ = dropout mask 2
-
-                # Contrastive loss: ép h₁ ≈ h₂, đẩy h_i khỏi câu khác trong batch
-                loss = criterion(embedding_1, embedding_2)
+                embedding_1 = model(ids, mask)
+                distillation_loss = distillation_criterion(
+                    embedding_1,
+                    teacher_embeddings
+                )
+                loss = TRAIN_CONFIG["stage0_distillation_weight"] * distillation_loss
 
             raw_loss = loss.detach()
             loss = loss / get_accumulation_divisor(batch_idx, len(train_loader), accumulation_steps)
@@ -481,7 +553,7 @@ def train_stage0_simcse(model, device, debug=True):
 
             if global_step % log_every == 0:
                 log_progress(
-                    "Stage0-SimCSE", epoch + 1, epochs, global_step,
+                    stage_log_name, epoch + 1, epochs, global_step,
                     total_batch_steps, epoch_loss, num_batches,
                     stage_start_time, scheduler.get_lr(),
                     time_budget_seconds=time_budget_seconds
@@ -499,7 +571,7 @@ def train_stage0_simcse(model, device, debug=True):
         # Evaluate
         spearman = evaluate_stsb(model, eval_loader, device)
         avg_loss = epoch_loss / max(num_batches, 1)
-        logger.info(f"[Stage0-SimCSE] Epoch {epoch+1}/{epochs} DONE | "
+        logger.info(f"[{stage_log_name}] Epoch {epoch+1}/{epochs} DONE | "
                    f"Avg Loss: {avg_loss:.4f} | STS-B Spearman: {spearman:.4f}")
 
         save_checkpoint(model, optimizer, scheduler, epoch + 1, global_step, avg_loss,
@@ -849,12 +921,12 @@ def main():
     logger.info(f"Tổng tham số: {total_params:,} (~{total_params/1e6:.1f}M)")
 
     # ===== Curriculum Learning (Bengio et al., ICML 2009) =====
-    # Stage 0: Unsupervised SimCSE (dễ nhất — chỉ cần text thô)
+    # Stage 0: supervised teacher-student distillation từ text thô
     # Stage 1: NLI (dễ — phân loại 3 classes)
     # Stage 2: Similarity + Hard Negatives (khó nhất — contrastive)
 
-    # Giai đoạn 0: Unsupervised SimCSE trên Wikipedia
-    train_stage0_simcse(model, device, debug=debug)
+    # Giai đoạn 0: supervised distillation trên Wikipedia
+    train_stage0_distillation(model, device, debug=debug)
 
     # Giai đoạn 1: NLI
     train_stage1_nli(model, device, debug=debug)

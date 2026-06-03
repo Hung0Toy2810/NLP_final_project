@@ -16,6 +16,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 
 class ScaledDotProductAttention(nn.Module):
@@ -38,7 +39,7 @@ class ScaledDotProductAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
-                mask: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
+                mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             query:  (batch, num_heads, seq_len, d_k)
@@ -141,7 +142,7 @@ class MultiHeadSelfAttention(nn.Module):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Self-Attention: Q, K, V đều từ cùng input x (vì đây là SELF-attention).
 

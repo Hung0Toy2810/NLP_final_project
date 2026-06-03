@@ -12,8 +12,9 @@
 
 import logging
 import numpy as np
+from typing import cast
 from rank_bm25 import BM25Okapi  # type: ignore
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from sklearn.metrics import accuracy_score
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -28,7 +29,10 @@ def evaluate_bm25_on_paws(debug=True):
     Thí nghiệm này nhằm chứng minh sự giới hạn của phương pháp truyền thống.
     """
     logger.info("Đang tải dữ liệu PAWS cho baseline BM25...")
-    paws = load_dataset("google-research-datasets/paws", "labeled_final", split="validation")
+    paws = cast(
+        Dataset,
+        load_dataset("google-research-datasets/paws", "labeled_final", split="validation")
+    )
 
     y_true = []
     bm25_scores = []
@@ -38,8 +42,9 @@ def evaluate_bm25_on_paws(debug=True):
         if i >= limit:
             break
 
-        s1 = row['sentence1'].lower().split()
-        s2 = row['sentence2'].lower().split()
+        item = cast(dict[str, object], row)
+        s1 = str(item['sentence1']).lower().split()
+        s2 = str(item['sentence2']).lower().split()
 
         # Tạo corpus với duy nhất 1 câu (sentence1)
         bm25 = BM25Okapi([s1])
@@ -47,7 +52,7 @@ def evaluate_bm25_on_paws(debug=True):
         score = bm25.get_scores(s2)[0]
 
         bm25_scores.append(score)
-        y_true.append(row['label'])
+        y_true.append(int(str(item['label'])))
 
     # BM25 không cho ra xác suất 0-1, ta tìm một ngưỡng (threshold) để chia nhãn
     threshold = np.median(bm25_scores)

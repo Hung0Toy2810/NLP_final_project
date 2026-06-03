@@ -9,6 +9,7 @@
 #   - Xavier Init: Glorot & Bengio, "Understanding the difficulty of training deep feedforward neural networks", AISTATS 2010
 #   - Cosine Annealing: Loshchilov & Hutter, "SGDR: Stochastic Gradient Descent with Warm Restarts", ICLR 2017
 #   - Dropout as Augmentation: Gao et al., "SimCSE", EMNLP 2021
+#   - Sentence Embedding Distillation: Reimers & Gurevych, EMNLP 2020
 #   - AdamW: Loshchilov & Hutter, "Decoupled Weight Decay Regularization", ICLR 2019
 # =============================================================================
 
@@ -85,13 +86,13 @@ TRAIN_CONFIG = {
     "gradient_accumulation_steps": 4,
 
     # --- Epochs ---
-    "epochs_stage0": 1,            # Stage 0: Unsupervised SimCSE trên Wikipedia (1 epoch đủ cho 20GB)
+    "epochs_stage0": 1,            # Stage 0: supervised teacher-student distillation trên Wikipedia
     "epochs_stage1": 4,            # Stage 1: NLI fine-tune
     "epochs_stage2": 4,            # Stage 2: Similarity fine-tune
 
     # --- Training Budget ---
     # Giữ full training trong ngân sách ~30 giờ trên A100 x1 bằng wall-clock
-    # early stopping cho Stage 0, vì Wikipedia SimCSE chiếm gần như toàn bộ thời gian.
+    # budget stopping cho Stage 0, vì Wikipedia distillation chiếm phần lớn thời gian.
     "target_train_hours": float(os.environ.get("SWFT_TARGET_TRAIN_HOURS", "30")),
     "stage0_time_budget_hours": float(os.environ.get("SWFT_STAGE0_TIME_BUDGET_HOURS", "24")),
     "stage0_max_samples": int(os.environ.get("SWFT_STAGE0_MAX_SAMPLES", "0")),
@@ -105,6 +106,16 @@ TRAIN_CONFIG = {
     # --- Contrastive Loss ---
     # SimCSE (EMNLP 2021): cosine similarity + temperature trong contrastive softmax
     "temperature": 0.05,
+
+    # --- Stage 0 Teacher-Student Distillation ---
+    # Reimers & Gurevych (EMNLP 2020): dùng sentence embedding teacher làm mục tiêu
+    # để student học nhanh hơn với ít dữ liệu/compute hơn.
+    "stage0_teacher_model": os.environ.get(
+        "SWFT_STAGE0_TEACHER_MODEL",
+        "sentence-transformers/all-mpnet-base-v2"
+    ),
+    "stage0_distillation_weight": float(os.environ.get("SWFT_STAGE0_DISTILLATION_WEIGHT", "1.0")),
+    "stage0_teacher_batch_size": int(os.environ.get("SWFT_STAGE0_TEACHER_BATCH_SIZE", "64")),
 
     # --- Mixed Precision ---
     "use_amp_on_cuda": True,       # FP16 trên CUDA — tiết kiệm VRAM & tăng tốc
