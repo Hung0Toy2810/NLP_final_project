@@ -21,6 +21,7 @@
 
 import os
 import logging
+import math
 import torch
 from typing import Optional
 from torch.utils.data import Dataset, DataLoader
@@ -29,6 +30,188 @@ from datasets import load_dataset, load_from_disk
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def _bytes_to_gb(value: Optional[float]) -> str:
+    if value is None:
+        return "unknown"
+    return f"{value / 1e9:.2f}GB"
+
+
+def _get_path_size_bytes(path: str) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for filename in files:
+            try:
+                total += os.path.getsize(os.path.join(root, filename))
+            except OSError:
+                continue
+    return total
+
+
+def _get_linux_memory_bytes() -> tuple[Optional[int], Optional[int]]:
+    meminfo_path = "/proc/meminfo"
+    if not os.path.exists(meminfo_path):
+        return None, None
+
+    values = {}
+    try:
+        with open(meminfo_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) >= 2:
+                    values[parts[0].rstrip(":")] = int(parts[1]) * 1024
+    except OSError:
+        return None, None
+
+    total = values.get("MemTotal")
+    available = values.get("MemAvailable", values.get("MemFree"))
+    return total, available
+
+
+def _get_system_memory_bytes() -> tuple[Optional[int], Optional[int]]:
+    total, available = _get_linux_memory_bytes()
+    if total is not None or available is not None:
+        return total, available
+
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        total = int(pages) * int(page_size)
+    except (AttributeError, OSError, ValueError):
+        total = None
+    return total, None
+
+
+def _should_keep_cache_in_memory(cache_path: str, label: str) -> bool:
+    """
+    Decide whether HuggingFace Arrow cache can be safely copied into RAM.
+
+    `load_from_disk(..., keep_in_memory=True)` can speed up random access, but
+    forcing a large cache into Python memory is dangerous on rented instances.
+    Auto mode only enables it when estimated memory use fits under both a
+    reserve and a max-RAM-fraction gate. Otherwise we keep memory mapping, which
+    still lets the OS use page cache opportunistically without OOM risk.
+    """
+    mode = os.environ.get("SWFT_DATA_KEEP_IN_MEMORY", "auto").strip().lower()
+    if mode in {"0", "false", "no", "mmap", "off"}:
+        logger.info("[Cache-RAM] %s: keep_in_memory disabled; using memory-map", label)
+        return False
+    if mode not in {"auto", "1", "true", "yes", "on"}:
+        logger.warning("[Cache-RAM] %s: invalid SWFT_DATA_KEEP_IN_MEMORY=%s; using auto",
+                       label, mode)
+        mode = "auto"
+
+    cache_size = _get_path_size_bytes(cache_path)
+    total_ram, available_ram = _get_system_memory_bytes()
+    reserve_gb = float(os.environ.get("SWFT_DATA_RAM_RESERVE_GB", "2"))
+    max_fraction = float(os.environ.get("SWFT_DATA_RAM_MAX_FRACTION", "0.75"))
+    expansion_factor = float(os.environ.get("SWFT_DATA_MEMORY_EXPANSION_FACTOR", "1.35"))
+    reserve_bytes = max(0.0, reserve_gb) * 1e9
+    required_bytes = cache_size * max(1.0, expansion_factor)
+
+    budget_candidates = []
+    if available_ram is not None:
+        budget_candidates.append(max(0.0, available_ram - reserve_bytes))
+    if total_ram is not None:
+        budget_candidates.append(max(0.0, total_ram * max(0.1, min(max_fraction, 0.95))))
+    safe_budget = min(budget_candidates) if budget_candidates else 0.0
+    decision = bool(safe_budget and required_bytes <= safe_budget)
+
+    if mode in {"1", "true", "yes", "on"} and not decision:
+        logger.warning(
+            "[Cache-RAM] %s: requested keep_in_memory but safety gate refused "
+            "(cache=%s, required~%s, safe_budget=%s, available=%s, reserve=%.1fGB)",
+            label,
+            _bytes_to_gb(cache_size),
+            _bytes_to_gb(required_bytes),
+            _bytes_to_gb(safe_budget),
+            _bytes_to_gb(available_ram),
+            reserve_gb,
+        )
+        return False
+
+    logger.info(
+        "[Cache-RAM] %s: cache=%s | required~%s | available=%s | "
+        "safe_budget=%s | reserve=%.1fGB | mode=%s | keep_in_memory=%s",
+        label,
+        _bytes_to_gb(cache_size),
+        _bytes_to_gb(required_bytes),
+        _bytes_to_gb(available_ram),
+        _bytes_to_gb(safe_budget),
+        reserve_gb,
+        mode,
+        decision,
+    )
+    return decision
+
+
+def load_cache_from_disk(cache_path: str, label: str):
+    keep_in_memory = _should_keep_cache_in_memory(cache_path, label)
+    return load_from_disk(cache_path, keep_in_memory=keep_in_memory)
+
+
+def _find_coprime_multiplier(size: int, seed: int) -> int:
+    """Find a deterministic multiplier that forms a full-cycle permutation."""
+    if size <= 1:
+        return 1
+    candidate = (0x9E3779B97F4A7C15 ^ abs(seed)) % size
+    candidate = max(1, candidate)
+    while math.gcd(candidate, size) != 1:
+        candidate = (candidate + 2) % size
+        if candidate == 0:
+            candidate = 1
+    return candidate
+
+
+class RandomIndexSplitDataset(Dataset):
+    """
+    Deterministic random-looking split without storing millions of indices.
+
+    The mapping is a bijection over [0, len(dataset)), then validation takes the
+    first ratio-sized block and train takes the rest. Because the two blocks are
+    disjoint in the same permutation, train/validation cannot overlap.
+    """
+
+    def __init__(self, dataset: Dataset, split: str,
+                 validation_ratio: float = 0.02, seed: int = 42):
+        if split not in {"train", "validation"}:
+            raise ValueError(f"Unsupported split: {split}")
+        if not 0.0 < validation_ratio < 1.0:
+            raise ValueError(
+                "validation_ratio phải nằm trong khoảng (0, 1), "
+                f"nhận được {validation_ratio}"
+            )
+
+        self.dataset = dataset
+        self.split = split
+        self.validation_ratio = validation_ratio
+        self.seed = seed
+        self.total_size = len(dataset)
+        self.validation_size = max(1, int(round(self.total_size * validation_ratio)))
+        self.validation_size = min(self.validation_size, max(0, self.total_size - 1))
+        self.train_size = self.total_size - self.validation_size
+        self._multiplier = _find_coprime_multiplier(self.total_size, seed)
+        self._offset = seed % max(1, self.total_size)
+
+        if split == "validation":
+            self._start = 0
+            self._length = self.validation_size
+        else:
+            self._start = self.validation_size
+            self._length = self.train_size
+
+    def __len__(self):
+        return self._length
+
+    def _map_index(self, idx: int) -> int:
+        if idx < 0 or idx >= self._length:
+            raise IndexError(idx)
+        permuted_position = self._start + idx
+        return (self._offset + permuted_position * self._multiplier) % self.total_size
+
+    def __getitem__(self, idx):
+        return self.dataset[self._map_index(idx)]
 
 
 def _as_long_tensor(value):
@@ -86,7 +269,7 @@ class WikipediaDistillationDataset(Dataset):
             # Chế độ A: Đọc từ cache pre-tokenized (Apache Arrow, zero-copy)
             cache_path = os.path.join(cache_dir, "wikipedia_tokenized")
             logger.info(f"[Cache] Loading pre-tokenized Wikipedia: {cache_path}")
-            self.data = load_from_disk(cache_path)
+            self.data = load_cache_from_disk(cache_path, "Wikipedia")
             if debug:
                 self.data = self.data.select(range(min(num_debug_samples, len(self.data))))
             elif max_samples is not None and max_samples > 0 and max_samples < len(self.data):
@@ -173,7 +356,7 @@ class NLIDataset(Dataset):
         if self.use_cache:
             cache_path = os.path.join(cache_dir, "snli_tokenized")
             logger.info(f"[Cache] Loading pre-tokenized SNLI: {cache_path}")
-            self.data = load_from_disk(cache_path)['train']
+            self.data = load_cache_from_disk(cache_path, "SNLI")['train']
             if debug:
                 self.data = self.data.select(range(min(num_debug_samples, len(self.data))))
             logger.info(f"SNLI samples loaded: {len(self.data):,}")
@@ -240,7 +423,7 @@ class SimilarityDataset(Dataset):
         if self.use_cache:
             cache_path = os.path.join(cache_dir, "paws_tokenized")
             logger.info(f"[Cache] Loading pre-tokenized PAWS: {cache_path}")
-            full_data = load_from_disk(cache_path)['train']
+            full_data = load_cache_from_disk(cache_path, "PAWS")['train']
 
             if include_hard_negatives:
                 self.positives = full_data.filter(lambda x: x['label'] == 1)
@@ -336,7 +519,7 @@ class STSBDataset(Dataset):
         if self.use_cache:
             cache_path = os.path.join(cache_dir, "stsb_tokenized")
             logger.info(f"[Cache] Loading pre-tokenized STS-B ({split}): {cache_path}")
-            self.data = load_from_disk(cache_path)[split]
+            self.data = load_cache_from_disk(cache_path, "STS-B")[split]
             if debug:
                 self.data = self.data.select(range(min(num_debug_samples, len(self.data))))
             logger.info(f"STS-B ({split}) loaded: {len(self.data)}")
@@ -396,7 +579,7 @@ class PAWSEvalDataset(Dataset):
         if self.use_cache:
             cache_path = os.path.join(cache_dir, "paws_tokenized")
             logger.info(f"[Cache] Loading pre-tokenized PAWS ({split}): {cache_path}")
-            self.data = load_from_disk(cache_path)[split]
+            self.data = load_cache_from_disk(cache_path, "PAWS-eval")[split]
             if debug:
                 self.data = self.data.select(range(min(num_debug_samples, len(self.data))))
         else:

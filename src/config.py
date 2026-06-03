@@ -117,6 +117,8 @@ TRAIN_CONFIG = {
     ),
     "stage0_distillation_weight": float(os.environ.get("SWFT_STAGE0_DISTILLATION_WEIGHT", "1.0")),
     "stage0_teacher_batch_size": int(os.environ.get("SWFT_STAGE0_TEACHER_BATCH_SIZE", "64")),
+    "stage0_validation_ratio": float(os.environ.get("SWFT_STAGE0_VALIDATION_RATIO", "0.02")),
+    "stage0_split_seed": int(os.environ.get("SWFT_STAGE0_SPLIT_SEED", "42")),
 
     # --- Mixed Precision ---
     "use_amp_on_cuda": True,       # FP16 trên CUDA — tiết kiệm VRAM & tăng tốc

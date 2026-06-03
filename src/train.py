@@ -25,6 +25,7 @@ import logging
 import math
 import time
 import shutil
+import gc
 import torch
 import torch.nn as nn
 from typing import Optional
@@ -41,7 +42,7 @@ from losses import (
 )
 from dataset import (
     get_tokenizer, WikipediaDistillationDataset, NLIDataset, SimilarityDataset,
-    STSBDataset, create_dataloader
+    STSBDataset, RandomIndexSplitDataset, create_dataloader
 )
 from training_log import init_training_logger, log_event
 
@@ -150,14 +151,45 @@ def load_checkpoint(model, optimizer, scheduler, path, device,
         return 0, 0
 
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint['model_state_dict'])
+
+    checkpoint_param_groups = checkpoint.get('optimizer_state_dict', {}).get('param_groups', [])
+    optimizer_param_groups = optimizer.state_dict().get('param_groups', [])
+    compatible_optimizer = len(checkpoint_param_groups) == len(optimizer_param_groups)
+    if compatible_optimizer:
+        for saved_group, current_group in zip(checkpoint_param_groups, optimizer_param_groups):
+            if len(saved_group.get('params', [])) != len(current_group.get('params', [])):
+                compatible_optimizer = False
+                break
+    if not compatible_optimizer:
+        logger.warning(
+            "Checkpoint không tương thích optimizer, bỏ qua để tránh resume sai: %s",
+            path
+        )
+        return 0, 0
+
     if extra_modules:
         extra_state = checkpoint.get('extra_module_state_dicts', {})
         for name, module in extra_modules.items():
             if name in extra_state:
-                module.load_state_dict(extra_state[name])
+                continue
             else:
-                logger.warning(f"Checkpoint không có state cho module phụ: {name}")
+                logger.warning(
+                    "Checkpoint thiếu state cho module phụ '%s', bỏ qua checkpoint: %s",
+                    name,
+                    path,
+                )
+                return 0, 0
+
+    try:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        if extra_modules:
+            extra_state = checkpoint.get('extra_module_state_dicts', {})
+            for name, module in extra_modules.items():
+                module.load_state_dict(extra_state[name])
+    except (KeyError, RuntimeError, ValueError) as exc:
+        logger.warning("Checkpoint không tương thích model/module, bỏ qua %s: %s", path, exc)
+        return 0, 0
+
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     scheduler.current_step = checkpoint['scheduler_step']
 
@@ -237,6 +269,14 @@ def get_disk_usage(path: Optional[str]) -> dict:
         }
     except OSError:
         return {}
+
+
+def cleanup_after_stage(device, stage_name: str):
+    """Release Python/CUDA caches before the next stage loads another dataset."""
+    collected = gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    logger.info("[Memory] Cleanup after %s | gc_collected=%s", stage_name, collected)
 
 
 def get_progress_log_every_steps() -> int:
@@ -412,6 +452,40 @@ def evaluate_stsb(model, eval_dataloader, device):
     return spearman_corr
 
 
+def evaluate_stage0_distillation(model, teacher_model, tokenizer, eval_dataloader,
+                                 device, criterion, use_amp: bool):
+    """
+    Held-out Stage 0 validation: đo student mimic teacher trên Wikipedia split
+    không tham gia training.
+    """
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+    num_samples = 0
+
+    with torch.no_grad():
+        for batch in eval_dataloader:
+            ids = batch['input_ids'].to(device)
+            mask = batch['attention_mask'].to(device)
+            teacher_embeddings = encode_stage0_teacher_embeddings(
+                teacher_model, tokenizer, ids, device
+            )
+
+            with autocast(device_type=device.type, enabled=use_amp):
+                student_embeddings = model(ids, mask)
+                loss = criterion(student_embeddings, teacher_embeddings)
+
+            batch_size = ids.size(0)
+            total_loss += loss.item() * batch_size
+            num_batches += 1
+            num_samples += batch_size
+
+    avg_loss = total_loss / max(num_samples, 1)
+    avg_cosine = 1.0 - avg_loss
+    model.train()
+    return avg_loss, avg_cosine, num_batches, num_samples
+
+
 def _create_eval_loader(device, debug, cache_dir):
     """Helper: tạo eval dataloader cho STS-B."""
     tokenizer = get_tokenizer(DATA_CONFIG["tokenizer_name"])
@@ -466,7 +540,7 @@ def train_stage0_distillation(model, device, debug=True):
 
     # Dataset
     stage0_max_samples = TRAIN_CONFIG.get("stage0_max_samples") or None
-    wiki_dataset = WikipediaDistillationDataset(
+    wiki_dataset_full = WikipediaDistillationDataset(
         cache_dir=cache_dir,
         tokenizer=tokenizer,
         max_length=MODEL_CONFIG["max_seq_length"],
@@ -475,9 +549,32 @@ def train_stage0_distillation(model, device, debug=True):
         max_samples=stage0_max_samples,
         sample_offset=TRAIN_CONFIG.get("stage0_sample_offset", 0)
     )
-    train_loader = create_dataloader(wiki_dataset, batch_size=batch_size,
+    validation_ratio = float(TRAIN_CONFIG.get("stage0_validation_ratio", 0.02))
+    split_seed = int(TRAIN_CONFIG.get("stage0_split_seed", 42))
+    wiki_train_dataset = RandomIndexSplitDataset(
+        wiki_dataset_full,
+        split="train",
+        validation_ratio=validation_ratio,
+        seed=split_seed,
+    )
+    wiki_validation_dataset = RandomIndexSplitDataset(
+        wiki_dataset_full,
+        split="validation",
+        validation_ratio=validation_ratio,
+        seed=split_seed,
+    )
+    if len(wiki_train_dataset) + len(wiki_validation_dataset) != len(wiki_dataset_full):
+        raise RuntimeError("Stage0 split không bao phủ đúng toàn bộ Wikipedia dataset.")
+
+    train_loader = create_dataloader(wiki_train_dataset, batch_size=batch_size,
                                      shuffle=True, num_workers=num_workers,
                                      prefetch_factor=2 if num_workers > 0 else None)
+    stage0_validation_loader = create_dataloader(
+        wiki_validation_dataset, batch_size=batch_size,
+        shuffle=False, num_workers=num_workers,
+        prefetch_factor=2 if num_workers > 0 else None,
+        drop_last=False,
+    )
     accumulation_steps = get_gradient_accumulation_steps()
 
     # Evaluation
@@ -527,7 +624,14 @@ def train_stage0_distillation(model, device, debug=True):
         float(TRAIN_CONFIG.get("checkpoint_every_minutes", 30)) * 60.0
     )
 
-    logger.info(f"Wikipedia sentences: {len(wiki_dataset):,}")
+    logger.info(f"Wikipedia sentences: {len(wiki_dataset_full):,}")
+    logger.info(
+        "Stage0 held-out split: train=%s | validation=%s | ratio=%.4f | seed=%s",
+        f"{len(wiki_train_dataset):,}",
+        f"{len(wiki_validation_dataset):,}",
+        validation_ratio,
+        split_seed,
+    )
     logger.info(f"Epochs: {epochs}, Batch steps: {total_batch_steps}, "
                 f"Scheduler optimizer steps: {total_steps}, Warmup: {warmup_steps}")
     logger.info(f"Batch size: {batch_size}, Grad accumulation: {accumulation_steps}, "
@@ -554,6 +658,11 @@ def train_stage0_distillation(model, device, debug=True):
         debug=debug,
         time_budget_sec=time_budget_seconds,
         teacher_model=TRAIN_CONFIG["stage0_teacher_model"],
+        stage0_total_samples=len(wiki_dataset_full),
+        stage0_train_samples=len(wiki_train_dataset),
+        stage0_validation_samples=len(wiki_validation_dataset),
+        stage0_validation_ratio=validation_ratio,
+        stage0_split_seed=split_seed,
         **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
     )
 
@@ -627,11 +736,33 @@ def train_stage0_distillation(model, device, debug=True):
                 )
                 last_checkpoint_time = now
 
-        # Evaluate
+        # Evaluate held-out Wikipedia distillation split first. This split is
+        # never used by the train DataLoader, so it detects Stage 0 memorization.
+        stage0_val_loss, stage0_val_cosine, stage0_val_batches, stage0_val_samples = (
+            evaluate_stage0_distillation(
+                model,
+                teacher_model,
+                tokenizer,
+                stage0_validation_loader,
+                device,
+                distillation_criterion,
+                use_amp,
+            )
+        )
+
+        logger.info(f"[{stage_log_name}] Held-out Wikipedia | "
+                    f"Loss: {stage0_val_loss:.4f} | "
+                    f"Cosine: {stage0_val_cosine:.4f} | "
+                    f"Samples: {stage0_val_samples:,}")
+
+        # Evaluate downstream STS-B as a separate semantic quality signal.
         spearman = evaluate_stsb(model, eval_loader, device)
         avg_loss = epoch_loss / max(num_batches, 1)
         logger.info(f"[{stage_log_name}] Epoch {epoch+1}/{epochs} DONE | "
-                   f"Avg Loss: {avg_loss:.4f} | STS-B Spearman: {spearman:.4f}")
+                   f"Avg Loss: {avg_loss:.4f} | "
+                   f"Stage0 Val Loss: {stage0_val_loss:.4f} | "
+                   f"Stage0 Val Cosine: {stage0_val_cosine:.4f} | "
+                   f"STS-B Spearman: {spearman:.4f}")
         log_event(
             "epoch_end",
             stage=stage_log_name,
@@ -639,6 +770,12 @@ def train_stage0_distillation(model, device, debug=True):
             epochs=epochs,
             global_step=global_step,
             avg_loss=avg_loss,
+            stage0_val_loss=stage0_val_loss,
+            stage0_val_cosine=stage0_val_cosine,
+            stage0_val_batches=stage0_val_batches,
+            stage0_val_samples=stage0_val_samples,
+            stage0_validation_ratio=validation_ratio,
+            stage0_split_seed=split_seed,
             stsb_spearman=spearman,
             lr=scheduler.get_lr(),
             elapsed_sec=time.time() - stage_start_time,
@@ -1097,15 +1234,19 @@ def main():
 
     # Giai đoạn 0: supervised distillation trên Wikipedia
     train_stage0_distillation(model, device, debug=debug)
+    cleanup_after_stage(device, "Stage0")
 
     # Giai đoạn 1: NLI
     train_stage1_nli(model, device, debug=debug)
+    cleanup_after_stage(device, "Stage1")
 
     # Giai đoạn 2: Similarity contrastive learning trên PAWS
     train_stage2_similarity(model, device, debug=debug, include_hard_negatives=False)
+    cleanup_after_stage(device, "Stage2")
 
     # Giai đoạn 2+: Similarity + Hard Negatives (PAWS adversarial)
     train_stage2_similarity(model, device, debug=debug, include_hard_negatives=True)
+    cleanup_after_stage(device, "Stage2+HN")
 
     logger.info("🎉 HOÀN THÀNH TOÀN BỘ PIPELINE TRAINING!")
     log_event(

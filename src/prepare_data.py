@@ -41,16 +41,65 @@ logger = logging.getLogger(__name__)
 # Đường dẫn lưu cache (trên ổ cứng local NVMe của Vast.ai)
 DEFAULT_CACHE_DIR = "./data_cache"
 MAX_SEQ_LENGTH = 128
+DEFAULT_MAP_BATCH_SIZE = int(os.environ.get("SWFT_PREPARE_MAP_BATCH_SIZE", "5000"))
+DEFAULT_SENTENCE_BATCH_SIZE = int(os.environ.get("SWFT_PREPARE_SENTENCE_BATCH_SIZE", "1000"))
 
 
-def get_num_proc():
-    """Xác định số CPU cores để chạy song song."""
+def get_available_cpu_count() -> int:
+    """Số CPU cores mà process hiện tại thật sự được phép dùng."""
     try:
-        n = os.cpu_count()
-        # Giữ lại 2 cores cho hệ thống
-        return max(1, n - 2) if n else 1
+        sched_getaffinity = getattr(os, "sched_getaffinity", None)
+        if sched_getaffinity is not None:
+            return max(1, len(sched_getaffinity(0)))
+    except Exception:
+        pass
+
+    try:
+        return max(1, os.cpu_count() or 1)
     except Exception:
         return 1
+
+
+def get_num_proc() -> int:
+    """
+    Xác định số process cho HuggingFace dataset.map/filter.
+
+    Mặc định dùng toàn bộ CPU cores khả dụng của container. Có thể chỉnh bằng:
+      - SWFT_PREPARE_NUM_PROC=12 để ép số worker cụ thể
+      - SWFT_PREPARE_RESERVE_CORES=1 để chừa core cho hệ thống
+    """
+    available = get_available_cpu_count()
+    override = os.environ.get("SWFT_PREPARE_NUM_PROC")
+    if override:
+        try:
+            requested = int(override)
+            if requested > 0:
+                return max(1, min(requested, available))
+        except ValueError:
+            logger.warning("SWFT_PREPARE_NUM_PROC không hợp lệ: %s", override)
+
+    reserve = os.environ.get("SWFT_PREPARE_RESERVE_CORES", "0")
+    try:
+        reserved = max(0, int(reserve))
+    except ValueError:
+        logger.warning("SWFT_PREPARE_RESERVE_CORES không hợp lệ: %s", reserve)
+        reserved = 0
+    return max(1, available - reserved)
+
+
+def configure_cpu_parallelism(num_proc: int):
+    """
+    Cấu hình song song CPU cho bước encode/tokenize raw data.
+
+    dataset.map(num_proc=N) đã tạo N process. Nếu fast tokenizer lại tự bật
+    thread pool bên trong mỗi process thì dễ oversubscribe, làm CPU context
+    switch nhiều hơn. Vì vậy mặc định tắt tokenizer internal parallelism và
+    để multiprocessing của Datasets điều phối toàn bộ cores.
+    """
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    logger.info("   CPU cores available: %s", get_available_cpu_count())
+    logger.info("   HF map/filter workers: %s", num_proc)
+    logger.info("   TOKENIZERS_PARALLELISM: %s", os.environ.get("TOKENIZERS_PARALLELISM"))
 
 
 # =============================================================================
@@ -79,6 +128,7 @@ def prepare_wikipedia(tokenizer, cache_dir: str, debug: bool = False):
     logger.info("=" * 60)
 
     start = time.time()
+    num_proc = get_num_proc()
 
     # Tải Wikipedia — wikimedia/wikipedia là phiên bản mới nhất trên HuggingFace
     logger.info("Đang tải Wikipedia English từ HuggingFace...")
@@ -131,9 +181,9 @@ def prepare_wikipedia(tokenizer, cache_dir: str, debug: bool = False):
     sentences_dataset = wiki.map(
         extract_sentences,
         batched=True,
-        batch_size=1000,
+        batch_size=DEFAULT_SENTENCE_BATCH_SIZE,
         remove_columns=wiki.column_names,
-        num_proc=get_num_proc(),
+        num_proc=num_proc,
         desc="Tách sentences"
     )
 
@@ -158,9 +208,9 @@ def prepare_wikipedia(tokenizer, cache_dir: str, debug: bool = False):
     tokenized = sentences_dataset.map(
         tokenize_sentence,
         batched=True,
-        batch_size=5000,
+        batch_size=DEFAULT_MAP_BATCH_SIZE,
         remove_columns=['sentence'],
-        num_proc=get_num_proc(),
+        num_proc=num_proc,
         desc="Tokenize Wikipedia"
     )
 
@@ -194,6 +244,7 @@ def prepare_snli(tokenizer, cache_dir: str, debug: bool = False):
     logger.info("=" * 60)
 
     start = time.time()
+    num_proc = get_num_proc()
 
     # Tải SNLI
     logger.info("Đang tải SNLI từ HuggingFace...")
@@ -206,7 +257,7 @@ def prepare_snli(tokenizer, cache_dir: str, debug: bool = False):
     def filter_valid(example):
         return example['label'] != -1
 
-    snli = snli.filter(filter_valid, num_proc=get_num_proc(), desc="Lọc label=-1")
+    snli = snli.filter(filter_valid, num_proc=num_proc, desc="Lọc label=-1")
 
     if debug:
         snli = DatasetDict({
@@ -244,9 +295,9 @@ def prepare_snli(tokenizer, cache_dir: str, debug: bool = False):
     tokenized = snli.map(
         tokenize_nli,
         batched=True,
-        batch_size=5000,
+        batch_size=DEFAULT_MAP_BATCH_SIZE,
         remove_columns=['premise', 'hypothesis'],
-        num_proc=get_num_proc(),
+        num_proc=num_proc,
         desc="Tokenize SNLI"
     )
 
@@ -280,6 +331,7 @@ def prepare_paws(tokenizer, cache_dir: str, debug: bool = False):
     logger.info("=" * 60)
 
     start = time.time()
+    num_proc = get_num_proc()
 
     logger.info("Đang tải PAWS từ HuggingFace...")
     paws = load_dataset("google-research-datasets/paws", "labeled_final")
@@ -310,9 +362,9 @@ def prepare_paws(tokenizer, cache_dir: str, debug: bool = False):
     tokenized = paws.map(
         tokenize_paws,
         batched=True,
-        batch_size=5000,
+        batch_size=DEFAULT_MAP_BATCH_SIZE,
         remove_columns=['sentence1', 'sentence2', 'id'],
-        num_proc=get_num_proc(),
+        num_proc=num_proc,
         desc="Tokenize PAWS"
     )
 
@@ -346,6 +398,7 @@ def prepare_stsb(tokenizer, cache_dir: str, debug: bool = False):
     logger.info("=" * 60)
 
     start = time.time()
+    num_proc = get_num_proc()
 
     logger.info("Đang tải STS-B từ HuggingFace...")
     stsb = load_dataset("mteb/stsbenchmark-sts")
@@ -375,9 +428,9 @@ def prepare_stsb(tokenizer, cache_dir: str, debug: bool = False):
     tokenized = stsb.map(
         tokenize_stsb,
         batched=True,
-        batch_size=5000,
+        batch_size=DEFAULT_MAP_BATCH_SIZE,
         remove_columns=['sentence1', 'sentence2'],
-        num_proc=get_num_proc(),
+        num_proc=num_proc,
         desc="Tokenize STS-B"
     )
 
@@ -398,14 +451,26 @@ def main():
                         help="Debug mode: chỉ tải một phần nhỏ dữ liệu")
     parser.add_argument("--cache-dir", type=str, default=DEFAULT_CACHE_DIR,
                         help="Thư mục lưu dữ liệu đã tokenize")
+    parser.add_argument("--num-proc", type=int, default=None,
+                        help="Số process CPU cho dataset.map/filter; mặc định dùng toàn bộ core khả dụng")
+    parser.add_argument("--reserve-cores", type=int, default=None,
+                        help="Số core chừa lại cho hệ thống nếu không đặt --num-proc")
     args = parser.parse_args()
 
+    if args.num_proc is not None:
+        os.environ["SWFT_PREPARE_NUM_PROC"] = str(args.num_proc)
+    if args.reserve_cores is not None:
+        os.environ["SWFT_PREPARE_RESERVE_CORES"] = str(args.reserve_cores)
+
     os.makedirs(args.cache_dir, exist_ok=True)
+    num_proc = get_num_proc()
+    configure_cpu_parallelism(num_proc)
 
     logger.info(" BẮT ĐẦU CHUẨN BỊ DỮ LIỆU")
     logger.info(f"   Cache dir: {args.cache_dir}")
     logger.info(f"   Debug mode: {args.debug}")
-    logger.info(f"   CPU cores: {get_num_proc()}")
+    logger.info(f"   Map batch size: {DEFAULT_MAP_BATCH_SIZE}")
+    logger.info(f"   Sentence batch size: {DEFAULT_SENTENCE_BATCH_SIZE}")
 
     # Load tokenizer một lần duy nhất
     logger.info("Đang load AutoTokenizer fast (bert-base-uncased)...")
