@@ -91,16 +91,17 @@ TRAIN_CONFIG = {
     "epochs_stage2": 4,            # Stage 2: Similarity fine-tune
 
     # --- Training Budget ---
-    # Giữ full training trong ngân sách ~30 giờ trên A100 x1 bằng wall-clock
-    # budget stopping cho Stage 0, vì Wikipedia distillation chiếm phần lớn thời gian.
-    "target_train_hours": float(os.environ.get("SWFT_TARGET_TRAIN_HOURS", "30")),
-    "stage0_time_budget_hours": float(os.environ.get("SWFT_STAGE0_TIME_BUDGET_HOURS", "24")),
+    # Default theo phương án L40S ~$0.86/h với ngân sách GPU khoảng $47:
+    # ~54 giờ tổng, Stage 0 KD ~38 giờ, phần còn lại cho Stage 1/2 và dự phòng.
+    # Có thể override bằng env khi chuyển GPU hoặc cần siết chi phí.
+    "target_train_hours": float(os.environ.get("SWFT_TARGET_TRAIN_HOURS", "54")),
+    "stage0_time_budget_hours": float(os.environ.get("SWFT_STAGE0_TIME_BUDGET_HOURS", "38")),
     "stage0_max_samples": int(os.environ.get("SWFT_STAGE0_MAX_SAMPLES", "0")),
     "stage0_sample_offset": int(os.environ.get("SWFT_STAGE0_SAMPLE_OFFSET", "0")),
     # Dùng giá trị nhanh/bảo thủ để cosine schedule không rơi về LR=0 quá sớm
     # nếu GPU thực tế nhanh hơn dự kiến.
     "stage0_scheduler_expected_seconds_per_batch": float(os.environ.get("SWFT_STAGE0_EXPECTED_SECONDS_PER_BATCH", "0.06")),
-    "checkpoint_every_minutes": float(os.environ.get("SWFT_CHECKPOINT_EVERY_MINUTES", "30")),
+    "checkpoint_every_minutes": float(os.environ.get("SWFT_CHECKPOINT_EVERY_MINUTES", "20")),
     "progress_log_every_steps": int(os.environ.get("SWFT_LOG_EVERY_STEPS", "500")),
 
     # --- Contrastive Loss ---
