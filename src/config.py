@@ -79,16 +79,32 @@ TRAIN_CONFIG = {
     # --- Batch Size ---
     "batch_size_debug": 8,         # Nhỏ cho MPS debug
     "batch_size_train": 64,        # Per-GPU trên H100 80GB VRAM
-    "gradient_accumulation_steps": 4,  # Effective batch = 64 × 4 = 256
+    # Effective optimizer batch = batch_size × accumulation.
+    # Với contrastive softmax, số in-batch negatives vẫn là batch_size - 1,
+    # vì gradient accumulation không ghép các similarity matrix lại với nhau.
+    "gradient_accumulation_steps": 4,
 
     # --- Epochs ---
     "epochs_stage0": 1,            # Stage 0: Unsupervised SimCSE trên Wikipedia (1 epoch đủ cho 20GB)
     "epochs_stage1": 4,            # Stage 1: NLI fine-tune
     "epochs_stage2": 4,            # Stage 2: Similarity fine-tune
 
-    # --- MNR Loss ---
-    # Henderson et al., 2017 — Multiple Negatives Ranking
-    "temperature": 0.05,           # Scale cosine similarity trong MNR Loss
+    # --- Training Budget ---
+    # Giữ full training trong ngân sách ~30 giờ trên A100 x1 bằng wall-clock
+    # early stopping cho Stage 0, vì Wikipedia SimCSE chiếm gần như toàn bộ thời gian.
+    "target_train_hours": float(os.environ.get("SWFT_TARGET_TRAIN_HOURS", "30")),
+    "stage0_time_budget_hours": float(os.environ.get("SWFT_STAGE0_TIME_BUDGET_HOURS", "24")),
+    "stage0_max_samples": int(os.environ.get("SWFT_STAGE0_MAX_SAMPLES", "0")),
+    "stage0_sample_offset": int(os.environ.get("SWFT_STAGE0_SAMPLE_OFFSET", "0")),
+    # Dùng giá trị nhanh/bảo thủ để cosine schedule không rơi về LR=0 quá sớm
+    # nếu GPU thực tế nhanh hơn dự kiến.
+    "stage0_scheduler_expected_seconds_per_batch": float(os.environ.get("SWFT_STAGE0_EXPECTED_SECONDS_PER_BATCH", "0.06")),
+    "checkpoint_every_minutes": float(os.environ.get("SWFT_CHECKPOINT_EVERY_MINUTES", "30")),
+    "progress_log_every_steps": int(os.environ.get("SWFT_LOG_EVERY_STEPS", "500")),
+
+    # --- Contrastive Loss ---
+    # SimCSE (EMNLP 2021): cosine similarity + temperature trong contrastive softmax
+    "temperature": 0.05,
 
     # --- Mixed Precision ---
     "use_amp_on_cuda": True,       # FP16 trên CUDA — tiết kiệm VRAM & tăng tốc

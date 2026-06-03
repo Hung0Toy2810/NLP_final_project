@@ -1,3 +1,4 @@
+# pyright: reportAttributeAccessIssue=false, reportArgumentType=false, reportCallIssue=false, reportOptionalCall=false, reportOperatorIssue=false
 # =============================================================================
 # dataset.py — Custom Dataset & DataLoader (PyTorch thuần)
 # =============================================================================
@@ -20,23 +21,34 @@
 import os
 import logging
 import torch
+from typing import Optional
 from torch.utils.data import Dataset, DataLoader
-from transformers import BertTokenizerFast  # CHỈ dùng tokenizer, không dùng model
+from transformers import AutoTokenizer  # CHỈ dùng tokenizer, không dùng model
 from datasets import load_dataset, load_from_disk
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
+def _as_long_tensor(value):
+    """Convert cached Arrow/list/tensor values to a detached long tensor."""
+    return torch.as_tensor(value, dtype=torch.long).clone().detach()
+
+
+def _as_float_tensor(value):
+    """Convert cached Arrow/list/tensor values to a detached float tensor."""
+    return torch.as_tensor(value, dtype=torch.float32).clone().detach()
+
+
 # =============================================================================
 # TOKENIZER — Devlin et al., "BERT", NAACL 2019
-# Chỉ dùng BertTokenizerFast để tách chuỗi text thành Token IDs.
+# Chỉ dùng AutoTokenizer fast để tách chuỗi text thành Token IDs.
 # Toàn bộ neural network phía sau là PyTorch thuần.
 # =============================================================================
 
 def get_tokenizer(tokenizer_name: str = "bert-base-uncased"):
     """Load WordPiece tokenizer từ HuggingFace (chỉ tokenizer, không model)."""
-    return BertTokenizerFast.from_pretrained(tokenizer_name)
+    return AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
 
 
 # =============================================================================
@@ -50,7 +62,7 @@ def get_tokenizer(tokenizer_name: str = "bert-base-uncased"):
 #   1. Mỗi sample chỉ có 1 câu (không cần cặp câu hay nhãn)
 #   2. Trong training loop, cùng 1 câu được encode 2 lần
 #   3. Do nn.Dropout(0.1) khác nhau mỗi lần forward → tạo ra 2 vector khác nhau
-#   4. MNR Loss ép 2 vector (cùng 1 câu) lại gần nhau, đẩy câu khác ra xa
+#   4. Contrastive loss ép 2 vector (cùng 1 câu) lại gần nhau, đẩy câu khác ra xa
 
 class WikipediaSimCSEDataset(Dataset):
     """
@@ -61,10 +73,14 @@ class WikipediaSimCSEDataset(Dataset):
     Positive pair được tạo tự động nhờ Dropout trong training loop.
     """
 
-    def __init__(self, cache_dir: str = None, tokenizer=None,
+    def __init__(self, cache_dir: Optional[str] = None, tokenizer=None,
                  max_length: int = 128, debug: bool = True,
-                 num_debug_samples: int = 5000):
+                 num_debug_samples: int = 5000,
+                 max_samples: Optional[int] = None,
+                 sample_offset: int = 0):
         self.max_length = max_length
+        self.max_samples = max_samples
+        self.sample_offset = max(0, sample_offset)
         self.use_cache = cache_dir is not None and os.path.exists(
             os.path.join(cache_dir, "wikipedia_tokenized")
         )
@@ -76,8 +92,19 @@ class WikipediaSimCSEDataset(Dataset):
             self.data = load_from_disk(cache_path)
             if debug:
                 self.data = self.data.select(range(min(num_debug_samples, len(self.data))))
+            elif max_samples is not None and max_samples > 0 and max_samples < len(self.data):
+                start = min(self.sample_offset, len(self.data) - max_samples)
+                end = start + max_samples
+                self.data = self.data.select(range(start, end))
+                logger.info(f"[Budget] Wikipedia subset: {start:,} → {end:,} "
+                            f"({len(self.data):,} sentences)")
             logger.info(f"Wikipedia sentences loaded: {len(self.data):,}")
         else:
+            if not debug:
+                raise RuntimeError(
+                    "Full Stage 0 cần cache pre-tokenized. Chạy prepare_data.py trước, "
+                    "hoặc bật DEBUG_CONFIG['enabled']=True cho streaming debug."
+                )
             # Chế độ B: Tải on-the-fly (cho debug MPS khi chưa chạy prepare_data.py)
             logger.info("[On-the-fly] Tải Wikipedia trực tiếp (streaming debug)...")
             self.tokenizer = tokenizer
@@ -109,8 +136,8 @@ class WikipediaSimCSEDataset(Dataset):
         if self.use_cache:
             item = self.data[idx]
             return {
-                'input_ids': item['input_ids'].clone().detach().long(),
-                'attention_mask': item['attention_mask'].clone().detach().long(),
+                'input_ids': _as_long_tensor(item['input_ids']),
+                'attention_mask': _as_long_tensor(item['attention_mask']),
             }
         else:
             enc = self.tokenizer(
@@ -138,7 +165,7 @@ class NLIDataset(Dataset):
     Bengio et al., ICML 2009: bắt đầu từ task dễ (phân loại 3 classes).
     """
 
-    def __init__(self, cache_dir: str = None, tokenizer=None,
+    def __init__(self, cache_dir: Optional[str] = None, tokenizer=None,
                  max_length: int = 128, debug: bool = True,
                  num_debug_samples: int = 3000):
         self.max_length = max_length
@@ -172,11 +199,11 @@ class NLIDataset(Dataset):
         if self.use_cache:
             item = self.data[idx]
             return {
-                'input_ids_a': item['input_ids_a'].clone().detach().long(),
-                'attention_mask_a': item['attention_mask_a'].clone().detach().long(),
-                'input_ids_b': item['input_ids_b'].clone().detach().long(),
-                'attention_mask_b': item['attention_mask_b'].clone().detach().long(),
-                'label': item['label'].clone().detach().long() if isinstance(item['label'], torch.Tensor) else torch.tensor(item['label'], dtype=torch.long),
+                'input_ids_a': _as_long_tensor(item['input_ids_a']),
+                'attention_mask_a': _as_long_tensor(item['attention_mask_a']),
+                'input_ids_b': _as_long_tensor(item['input_ids_b']),
+                'attention_mask_b': _as_long_tensor(item['attention_mask_b']),
+                'label': _as_long_tensor(item['label']),
             }
         else:
             item = self.raw_data[idx]
@@ -204,7 +231,7 @@ class SimilarityDataset(Dataset):
     PAWS chứa adversarial hard negatives: câu có cùng từ vựng nhưng khác nghĩa.
     """
 
-    def __init__(self, cache_dir: str = None, tokenizer=None,
+    def __init__(self, cache_dir: Optional[str] = None, tokenizer=None,
                  max_length: int = 128, debug: bool = True,
                  num_debug_samples: int = 3000, include_hard_negatives: bool = False):
         self.max_length = max_length
@@ -250,7 +277,7 @@ class SimilarityDataset(Dataset):
 
     def __len__(self):
         if self.include_hard_negatives:
-            return len(self.positives)
+            return 2 * min(len(self.positives), len(self.negatives))
         if self.use_cache:
             return len(self.data)
         return len(self.raw_data)
@@ -259,10 +286,10 @@ class SimilarityDataset(Dataset):
         """Helper: extract pair tensors from either cached or raw item."""
         if is_cached:
             return {
-                'input_ids_a': torch.tensor(item['input_ids_a'], dtype=torch.long),
-                'attention_mask_a': torch.tensor(item['attention_mask_a'], dtype=torch.long),
-                'input_ids_b': torch.tensor(item['input_ids_b'], dtype=torch.long),
-                'attention_mask_b': torch.tensor(item['attention_mask_b'], dtype=torch.long),
+                'input_ids_a': _as_long_tensor(item['input_ids_a']),
+                'attention_mask_a': _as_long_tensor(item['attention_mask_a']),
+                'input_ids_b': _as_long_tensor(item['input_ids_b']),
+                'attention_mask_b': _as_long_tensor(item['attention_mask_b']),
             }
         else:
             enc1 = self.tokenizer(item['sentence1'], max_length=self.max_length,
@@ -278,20 +305,11 @@ class SimilarityDataset(Dataset):
 
     def __getitem__(self, idx):
         if self.include_hard_negatives:
-            pos_item = self.positives[idx]
-            neg_idx = idx % len(self.negatives)
-            neg_item = self.negatives[neg_idx]
-
-            result = self._get_pair_from_item(pos_item, self.use_cache)
-
-            if self.use_cache:
-                result['input_ids_neg'] = torch.tensor(neg_item['input_ids_b'], dtype=torch.long)
-                result['attention_mask_neg'] = torch.tensor(neg_item['attention_mask_b'], dtype=torch.long)
-            else:
-                enc_neg = self.tokenizer(neg_item['sentence2'], max_length=self.max_length,
-                                         padding='max_length', truncation=True, return_tensors='pt')
-                result['input_ids_neg'] = enc_neg['input_ids'].squeeze(0)
-                result['attention_mask_neg'] = enc_neg['attention_mask'].squeeze(0)
+            pair_idx = idx // 2
+            is_positive = idx % 2 == 0
+            item = self.positives[pair_idx] if is_positive else self.negatives[pair_idx]
+            result = self._get_pair_from_item(item, self.use_cache)
+            result['label'] = torch.tensor(1 if is_positive else 0, dtype=torch.long)
             return result
         else:
             if self.use_cache:
@@ -310,7 +328,7 @@ class STSBDataset(Dataset):
     Đánh giá chất lượng embedding bằng Spearman correlation.
     """
 
-    def __init__(self, cache_dir: str = None, tokenizer=None,
+    def __init__(self, cache_dir: Optional[str] = None, tokenizer=None,
                  max_length: int = 128, split: str = "test",
                  debug: bool = True, num_debug_samples: int = 500):
         self.max_length = max_length
@@ -342,11 +360,11 @@ class STSBDataset(Dataset):
         if self.use_cache:
             item = self.data[idx]
             return {
-                'input_ids_a': item['input_ids_a'].clone().detach().long(),
-                'attention_mask_a': item['attention_mask_a'].clone().detach().long(),
-                'input_ids_b': item['input_ids_b'].clone().detach().long(),
-                'attention_mask_b': item['attention_mask_b'].clone().detach().long(),
-                'score': item['score'].clone().detach().float() if isinstance(item['score'], torch.Tensor) else torch.tensor(item['score'], dtype=torch.float32),
+                'input_ids_a': _as_long_tensor(item['input_ids_a']),
+                'attention_mask_a': _as_long_tensor(item['attention_mask_a']),
+                'input_ids_b': _as_long_tensor(item['input_ids_b']),
+                'attention_mask_b': _as_long_tensor(item['attention_mask_b']),
+                'score': _as_float_tensor(item['score']),
             }
         else:
             item = self.raw_data[idx]
@@ -369,24 +387,25 @@ class PAWSEvalDataset(Dataset):
     Binary: 0 (not paraphrase), 1 (paraphrase).
     """
 
-    def __init__(self, cache_dir: str = None, tokenizer=None,
-                 max_length: int = 128, debug: bool = True,
+    def __init__(self, cache_dir: Optional[str] = None, tokenizer=None,
+                 max_length: int = 128, split: str = "validation", debug: bool = True,
                  num_debug_samples: int = 500):
         self.max_length = max_length
+        self.split = split
         self.use_cache = cache_dir is not None and os.path.exists(
             os.path.join(cache_dir, "paws_tokenized")
         )
 
         if self.use_cache:
             cache_path = os.path.join(cache_dir, "paws_tokenized")
-            logger.info(f"[Cache] Loading pre-tokenized PAWS (validation): {cache_path}")
-            self.data = load_from_disk(cache_path)['validation']
+            logger.info(f"[Cache] Loading pre-tokenized PAWS ({split}): {cache_path}")
+            self.data = load_from_disk(cache_path)[split]
             if debug:
                 self.data = self.data.select(range(min(num_debug_samples, len(self.data))))
         else:
             self.tokenizer = tokenizer
-            logger.info("Đang tải PAWS validation...")
-            dataset = load_dataset("google-research-datasets/paws", "labeled_final", split="validation")
+            logger.info(f"Đang tải PAWS {split}...")
+            dataset = load_dataset("google-research-datasets/paws", "labeled_final", split=split)
             if debug:
                 dataset = dataset.select(range(min(num_debug_samples, len(dataset))))
             self.raw_data = dataset
@@ -400,11 +419,11 @@ class PAWSEvalDataset(Dataset):
         if self.use_cache:
             item = self.data[idx]
             return {
-                'input_ids_a': item['input_ids_a'].clone().detach().long(),
-                'attention_mask_a': item['attention_mask_a'].clone().detach().long(),
-                'input_ids_b': item['input_ids_b'].clone().detach().long(),
-                'attention_mask_b': item['attention_mask_b'].clone().detach().long(),
-                'label': item['label'].clone().detach().long() if isinstance(item['label'], torch.Tensor) else torch.tensor(item['label'], dtype=torch.long),
+                'input_ids_a': _as_long_tensor(item['input_ids_a']),
+                'attention_mask_a': _as_long_tensor(item['attention_mask_a']),
+                'input_ids_b': _as_long_tensor(item['input_ids_b']),
+                'attention_mask_b': _as_long_tensor(item['attention_mask_b']),
+                'label': _as_long_tensor(item['label']),
             }
         else:
             item = self.raw_data[idx]
@@ -426,7 +445,8 @@ class PAWSEvalDataset(Dataset):
 # =============================================================================
 
 def create_dataloader(dataset: Dataset, batch_size: int, shuffle: bool = True,
-                      num_workers: int = 0, prefetch_factor: int = None) -> DataLoader:
+                      num_workers: int = 0, prefetch_factor: Optional[int] = None,
+                      drop_last: bool = True) -> DataLoader:
     """
     Tạo DataLoader tối ưu cho cả MPS debug và CUDA training.
 
@@ -439,8 +459,8 @@ def create_dataloader(dataset: Dataset, batch_size: int, shuffle: bool = True,
         'batch_size': batch_size,
         'shuffle': shuffle,
         'num_workers': num_workers,
-        'pin_memory': True,
-        'drop_last': True,  # Quan trọng cho MNR Loss (cần batch đều)
+        'pin_memory': torch.cuda.is_available(),
+        'drop_last': drop_last,
     }
     # prefetch_factor chỉ hợp lệ khi num_workers > 0
     if num_workers > 0 and prefetch_factor:

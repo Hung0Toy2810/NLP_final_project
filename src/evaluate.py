@@ -34,10 +34,12 @@ def evaluate_stsb_full(model, device, debug=True):
     """
     tokenizer = get_tokenizer(DATA_CONFIG["tokenizer_name"])
     batch_size = TRAIN_CONFIG["batch_size_debug"] if debug else TRAIN_CONFIG["batch_size_train"]
+    cache_dir = TRAIN_CONFIG.get("data_cache_dir")
 
-    dataset = STSBDataset(tokenizer, split="test", debug=debug,
+    dataset = STSBDataset(cache_dir=cache_dir, tokenizer=tokenizer, split="test", debug=debug,
                           num_debug_samples=DEBUG_CONFIG["eval_samples"])
-    loader = create_dataloader(dataset, batch_size=batch_size, shuffle=False)
+    loader = create_dataloader(dataset, batch_size=batch_size, shuffle=False,
+                               drop_last=False)
 
     model.eval()
     all_cosine = []
@@ -62,7 +64,7 @@ def evaluate_stsb_full(model, device, debug=True):
     return spearman
 
 
-def evaluate_paws(model, device, debug=True):
+def evaluate_paws(model, device, debug=True, split="validation"):
     """
     Đánh giá trên PAWS — Zhang et al., NAACL 2019.
     Metric: Accuracy trên adversarial paraphrases.
@@ -70,10 +72,12 @@ def evaluate_paws(model, device, debug=True):
     """
     tokenizer = get_tokenizer(DATA_CONFIG["tokenizer_name"])
     batch_size = TRAIN_CONFIG["batch_size_debug"] if debug else TRAIN_CONFIG["batch_size_train"]
+    cache_dir = TRAIN_CONFIG.get("data_cache_dir")
 
-    dataset = PAWSEvalDataset(tokenizer, debug=debug,
+    dataset = PAWSEvalDataset(cache_dir=cache_dir, tokenizer=tokenizer, split=split, debug=debug,
                               num_debug_samples=DEBUG_CONFIG["eval_samples"])
-    loader = create_dataloader(dataset, batch_size=batch_size, shuffle=False)
+    loader = create_dataloader(dataset, batch_size=batch_size, shuffle=False,
+                               drop_last=False)
 
     model.eval()
     all_cosine = []
@@ -103,7 +107,8 @@ def evaluate_paws(model, device, debug=True):
             best_acc = acc
             best_threshold = threshold
 
-    logger.info(f" PAWS Test | Accuracy = {best_acc:.4f} (threshold={best_threshold:.2f})")
+    logger.info(f" PAWS {split} | Threshold-tuned accuracy = {best_acc:.4f} "
+                f"(threshold={best_threshold:.2f})")
     return best_acc
 
 

@@ -81,12 +81,12 @@ class SWFTModel(nn.Module):
         - So sánh bằng Cosine Similarity
         - Ưu điểm: pre-compute embeddings cho corpus → tìm kiếm siêu nhanh
 
-    Tổng tham số ước tính:
+    Tổng tham số với config mặc định hiện tại:
         Factorized Embedding: 30,522×128 + 128×768 ≈ 4.0M
-        4 Encoder Blocks: 4 × (3×768² + 768×3072×2 + 768² + bias) ≈ 18.9M
+        6 Encoder Blocks: 6 × ~7.09M ≈ 42.5M
         LayerNorm + Final: ≈ 0.01M
         ───────────────────────────────
-        Tổng: ≈ 23M tham số (vs BERT 110M = giảm ~5×)
+        Tổng: ≈ 46.5M tham số (vs BERT-base ~110M = giảm ~2.4×)
     """
 
     def __init__(self, vocab_size: int, embedding_dim: int, hidden_size: int,

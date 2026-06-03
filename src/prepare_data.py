@@ -27,9 +27,10 @@ import sys
 import time
 import logging
 import argparse
+from typing import cast
 
-from transformers import BertTokenizerFast
-from datasets import load_dataset, DatasetDict, Dataset
+from transformers import AutoTokenizer
+from datasets import load_dataset, DatasetDict, Dataset, IterableDataset
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,23 +86,23 @@ def prepare_wikipedia(tokenizer, cache_dir: str, debug: bool = False):
     if debug:
         # Debug: sử dụng streaming=True để tránh tải toàn bộ 20GB về máy
         logger.info("[DEBUG] Đang tải Wikipedia ở chế độ Streaming (chỉ lấy 10,000 articles)...")
-        wiki_stream = load_dataset(
+        wiki_stream = cast(IterableDataset, load_dataset(
             "wikimedia/wikipedia", "20231101.en",
             split="train",
             streaming=True
-        )
+        ))
         # Chỉ lấy 10,000 articles đầu tiên
         wiki_stream = wiki_stream.take(10000)
         
         # Chuyển đổi thành Dataset thông thường để hỗ trợ len(), num_proc và save_to_disk
         logger.info("[DEBUG] Đang chuyển đổi stream thành Dataset thông thường...")
-        wiki = Dataset.from_generator(
+        wiki = cast(Dataset, Dataset.from_generator(
             lambda: (yield from wiki_stream),
             features=wiki_stream.features
-        )
+        ))
         logger.info(f"[DEBUG] Tải {len(wiki)} articles")
     else:
-        wiki = load_dataset("wikimedia/wikipedia", "20231101.en", split="train")
+        wiki = cast(Dataset, load_dataset("wikimedia/wikipedia", "20231101.en", split="train"))
         logger.info(f"Tải {len(wiki)} articles (đầy đủ)")
 
     # Type assertion: load_dataset với split cụ thể luôn trả về Dataset (map-style),
@@ -261,7 +262,7 @@ def prepare_snli(tokenizer, cache_dir: str, debug: bool = False):
 
 
 # =============================================================================
-# 3. PAWS — cho Stage 2 (MNR Loss + Hard Negatives)
+# 3. PAWS — cho Stage 2 (Contrastive Loss + Hard Negatives)
 # =============================================================================
 # Zhang et al., "PAWS: Paraphrase Adversaries from Word Scrambling", NAACL 2019
 
@@ -408,8 +409,8 @@ def main():
     logger.info(f"   CPU cores: {get_num_proc()}")
 
     # Load tokenizer một lần duy nhất
-    logger.info("Đang load BertTokenizerFast (Devlin et al., NAACL 2019)...")
-    tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
+    logger.info("Đang load AutoTokenizer fast (bert-base-uncased)...")
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", use_fast=True)
     logger.info(f"   Vocab size: {tokenizer.vocab_size}")
 
     total_start = time.time()

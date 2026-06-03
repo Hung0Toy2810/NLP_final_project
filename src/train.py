@@ -7,7 +7,7 @@
 # Curriculum Learning Pipeline (Bengio et al., ICML 2009):
 #   Stage 0: Unsupervised SimCSE trên Wikipedia (Gao et al., EMNLP 2021)
 #   Stage 1: NLI SoftmaxLoss (Reimers & Gurevych, EMNLP 2019)
-#   Stage 2: MNR Loss + Hard Negatives trên PAWS (Zhang et al., NAACL 2019)
+#   Stage 2: Contrastive softmax + Hard Negatives trên PAWS (Zhang et al., NAACL 2019)
 #
 # Bài báo tham khảo:
 #   [1] Reimers & Gurevych, EMNLP 2019 — Sentence-BERT
@@ -22,9 +22,12 @@ import os
 import sys
 import logging
 import math
+import time
 import torch
 import torch.nn as nn
+from typing import Optional
 from torch.optim import AdamW
+from torch.amp import GradScaler, autocast  # pyright: ignore[reportPrivateImportUsage]
 
 # Thêm src vào path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -84,6 +87,7 @@ class CosineAnnealingWithWarmup:
         else:
             # Cosine Annealing
             progress = (self.current_step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+            progress = min(1.0, max(0.0, progress))
             lr = self.base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
         for param_group in self.optimizer.param_groups:
@@ -97,7 +101,8 @@ class CosineAnnealingWithWarmup:
 # CHECKPOINT: SAVE & LOAD (Resume Training)
 # =============================================================================
 
-def save_checkpoint(model, optimizer, scheduler, epoch, step, loss, path):
+def save_checkpoint(model, optimizer, scheduler, epoch, step, loss, path,
+                    extra_modules: Optional[dict] = None):
     """
     Lưu checkpoint để resume training.
     BẮT BUỘC khi train trên cloud (session có thể bị ngắt bất cứ lúc nào).
@@ -111,11 +116,17 @@ def save_checkpoint(model, optimizer, scheduler, epoch, step, loss, path):
         'step': step,
         'loss': loss,
     }
+    if extra_modules:
+        checkpoint['extra_module_state_dicts'] = {
+            name: module.state_dict()
+            for name, module in extra_modules.items()
+        }
     torch.save(checkpoint, path)
     logger.info(f" Checkpoint saved: {path} (epoch={epoch}, step={step}, loss={loss:.4f})")
 
 
-def load_checkpoint(model, optimizer, scheduler, path, device):
+def load_checkpoint(model, optimizer, scheduler, path, device,
+                    extra_modules: Optional[dict] = None):
     """
     Load checkpoint để resume training.
     Returns: (epoch, step) nếu tìm thấy checkpoint, (0, 0) nếu không.
@@ -126,6 +137,13 @@ def load_checkpoint(model, optimizer, scheduler, path, device):
 
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
+    if extra_modules:
+        extra_state = checkpoint.get('extra_module_state_dicts', {})
+        for name, module in extra_modules.items():
+            if name in extra_state:
+                module.load_state_dict(extra_state[name])
+            else:
+                logger.warning(f"Checkpoint không có state cho module phụ: {name}")
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     scheduler.current_step = checkpoint['scheduler_step']
 
@@ -135,6 +153,119 @@ def load_checkpoint(model, optimizer, scheduler, path, device):
     logger.info(f" Checkpoint loaded: {path} (epoch={epoch}, step={step}, loss={loss:.4f})")
 
     return epoch, step
+
+
+def load_previous_stage_if_needed(model, current_checkpoint_path: str,
+                                  previous_model_path: str, device,
+                                  current_stage: str, previous_stage: str):
+    """
+    Khi chạy từng stage riêng trên cloud, stage hiện tại nên bắt đầu từ stage trước
+    nếu chưa có checkpoint riêng của stage hiện tại.
+    """
+    if os.path.exists(current_checkpoint_path) or not os.path.exists(previous_model_path):
+        return
+
+    model.load_state_dict(torch.load(previous_model_path, map_location=device, weights_only=True))
+    logger.info(f"{current_stage}: loaded weights from {previous_stage}: {previous_model_path}")
+
+
+def get_gradient_accumulation_steps() -> int:
+    """Số mini-batches tích lũy trước mỗi optimizer step."""
+    return max(1, int(TRAIN_CONFIG.get("gradient_accumulation_steps", 1)))
+
+
+def get_update_steps_per_epoch(num_batches: int, accumulation_steps: int) -> int:
+    """Số optimizer updates mỗi epoch sau khi gradient accumulation."""
+    return math.ceil(num_batches / accumulation_steps)
+
+
+def get_accumulation_divisor(batch_idx: int, num_batches: int,
+                             accumulation_steps: int) -> int:
+    """
+    Chia loss theo số batch thực sự trong accumulation block.
+    Block cuối có thể ngắn hơn accumulation_steps.
+    """
+    block_start = (batch_idx // accumulation_steps) * accumulation_steps
+    block_end = min(block_start + accumulation_steps, num_batches)
+    return block_end - block_start
+
+
+def should_step_optimizer(batch_idx: int, num_batches: int,
+                          accumulation_steps: int) -> bool:
+    """True khi đã đủ accumulation block hoặc gặp batch cuối epoch."""
+    return ((batch_idx + 1) % accumulation_steps == 0) or (batch_idx + 1 == num_batches)
+
+
+def format_duration(seconds: float) -> str:
+    """Format ngắn gọn cho ETA/logging."""
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
+def get_progress_log_every_steps() -> int:
+    """Tần suất log progress theo batch steps."""
+    return max(1, int(TRAIN_CONFIG.get("progress_log_every_steps", 500)))
+
+
+def get_stage0_time_budget_seconds(debug: bool):
+    """Wall-clock budget cho Stage 0; tắt trong debug."""
+    if debug:
+        return None
+    hours = float(TRAIN_CONFIG.get("stage0_time_budget_hours", 0))
+    if hours <= 0:
+        return None
+    return hours * 3600.0
+
+
+def get_stage0_scheduler_steps(num_batches: int, accumulation_steps: int,
+                               time_budget_seconds) -> int:
+    """
+    Scheduler cần total_steps hữu hạn dù Stage 0 dừng theo timer.
+    Dùng expected seconds/batch bảo thủ; nếu chạy nhanh hơn, cosine được clamp ở 0.
+    """
+    full_update_steps = get_update_steps_per_epoch(num_batches, accumulation_steps)
+    if not time_budget_seconds:
+        return full_update_steps
+
+    expected_seconds = max(
+        1e-6,
+        float(TRAIN_CONFIG.get("stage0_scheduler_expected_seconds_per_batch", 0.12))
+    )
+    expected_batch_steps = max(1, int(time_budget_seconds / expected_seconds))
+    expected_update_steps = get_update_steps_per_epoch(expected_batch_steps, accumulation_steps)
+    return max(1, min(full_update_steps, expected_update_steps))
+
+
+def log_progress(stage_name: str, epoch: int, epochs: int, global_step: int,
+                 total_batch_steps: int, epoch_loss: float, num_batches: int,
+                 stage_start_time: float, lr: float,
+                 time_budget_seconds: Optional[float] = None):
+    """Log throughput và ETA để kiểm soát budget cloud."""
+    elapsed = max(time.time() - stage_start_time, 1e-9)
+    batches_per_sec = num_batches / elapsed
+    remaining_batches = max(0, total_batch_steps - global_step)
+    dataset_eta = remaining_batches / max(batches_per_sec, 1e-9)
+    budget_left = None
+    eta = dataset_eta
+    if time_budget_seconds is not None and time_budget_seconds > 0:
+        budget_left = max(0.0, time_budget_seconds - elapsed)
+        eta = min(dataset_eta, budget_left)
+    avg_loss = epoch_loss / max(num_batches, 1)
+    msg = (
+        f"[{stage_name}] Epoch {epoch}/{epochs} | Step {global_step}/{total_batch_steps} | "
+        f"Loss: {avg_loss:.4f} | LR: {lr:.2e} | "
+        f"{batches_per_sec:.2f} batch/s | Elapsed: {format_duration(elapsed)} | "
+        f"ETA: {format_duration(eta)}"
+    )
+    if budget_left is not None:
+        msg += f" | Budget left: {format_duration(budget_left)}"
+    logger.info(msg)
 
 
 # =============================================================================
@@ -188,7 +319,8 @@ def _create_eval_loader(device, debug, cache_dir):
     )
     return create_dataloader(stsb_dataset, batch_size=batch_size,
                              shuffle=False, num_workers=num_workers,
-                             prefetch_factor=2 if num_workers > 0 else None)
+                             prefetch_factor=2 if num_workers > 0 else None,
+                             drop_last=False)
 
 
 # =============================================================================
@@ -207,7 +339,7 @@ def _create_eval_loader(device, debug, cache_dir):
 #      h₁ = model(x)  ← Dropout mask lần 1 (ngẫu nhiên)
 #      h₂ = model(x)  ← Dropout mask lần 2 (ngẫu nhiên KHÁC)
 #   2. h₁ ≠ h₂ mặc dù input giống nhau (do Dropout khác nhau)
-#   3. MNR Loss ép h₁ và h₂ lại gần nhau, đẩy các câu khác trong batch ra xa
+#   3. Contrastive loss ép h₁ và h₂ lại gần nhau, đẩy các câu khác trong batch ra xa
 #   4. Kết quả: mô hình học được rằng "nội dung giống → embedding giống"
 
 def train_stage0_simcse(model, device, debug=True):
@@ -216,7 +348,7 @@ def train_stage0_simcse(model, device, debug=True):
     Curriculum Learning Stage 0 (dễ nhất) — Bengio et al., ICML 2009.
 
     Mục tiêu: Học biểu diễn ngôn ngữ cơ bản từ text thô Wikipedia
-    Loss: MNR Loss (cùng 1 câu encode 2 lần, Dropout tạo positive pair)
+    Loss: contrastive softmax (cùng 1 câu encode 2 lần, Dropout tạo positive pair)
     """
     logger.info("=" * 60)
     logger.info("GIAI ĐOẠN 0: UNSUPERVISED SimCSE (Wikipedia)")
@@ -230,21 +362,25 @@ def train_stage0_simcse(model, device, debug=True):
     num_workers = 0 if device.type != "cuda" else 8  # Wikipedia lớn → cần nhiều workers
 
     # Dataset
+    stage0_max_samples = TRAIN_CONFIG.get("stage0_max_samples") or None
     wiki_dataset = WikipediaSimCSEDataset(
         cache_dir=cache_dir,
         tokenizer=tokenizer,
         max_length=MODEL_CONFIG["max_seq_length"],
         debug=debug,
-        num_debug_samples=DEBUG_CONFIG["num_samples"]
+        num_debug_samples=DEBUG_CONFIG["num_samples"],
+        max_samples=stage0_max_samples,
+        sample_offset=TRAIN_CONFIG.get("stage0_sample_offset", 0)
     )
     train_loader = create_dataloader(wiki_dataset, batch_size=batch_size,
                                      shuffle=True, num_workers=num_workers,
                                      prefetch_factor=2 if num_workers > 0 else None)
+    accumulation_steps = get_gradient_accumulation_steps()
 
     # Evaluation
     eval_loader = _create_eval_loader(device, debug, cache_dir)
 
-    # Loss — MNR Loss (SimCSE sử dụng InfoNCE / MNR Loss)
+    # Loss — SimCSE-style contrastive softmax với in-batch negatives
     criterion = MultipleNegativesRankingLoss(temperature=TRAIN_CONFIG["temperature"])
 
     # Optimizer — AdamW, Loshchilov & Hutter, ICLR 2019
@@ -258,40 +394,67 @@ def train_stage0_simcse(model, device, debug=True):
 
     # LR Schedule
     epochs = TRAIN_CONFIG["epochs_stage0"]
-    total_steps = len(train_loader) * epochs
+    total_batch_steps = len(train_loader) * epochs
+    time_budget_seconds = get_stage0_time_budget_seconds(debug)
+    total_steps = get_stage0_scheduler_steps(
+        total_batch_steps, accumulation_steps, time_budget_seconds
+    )
     warmup_steps = int(TRAIN_CONFIG["warmup_ratio"] * total_steps)
     scheduler = CosineAnnealingWithWarmup(optimizer, warmup_steps, total_steps)
 
     # Mixed Precision
     use_amp = TRAIN_CONFIG["use_amp_on_cuda"] and device.type == "cuda"
-    scaler = torch.amp.GradScaler(enabled=use_amp)
+    scaler = GradScaler(enabled=use_amp)
 
     # Resume
     checkpoint_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage0_latest.pt")
     start_epoch, start_step = load_checkpoint(model, optimizer, scheduler, checkpoint_path, device)
 
+    log_every = get_progress_log_every_steps()
+    checkpoint_interval_seconds = max(
+        60.0,
+        float(TRAIN_CONFIG.get("checkpoint_every_minutes", 30)) * 60.0
+    )
+
     logger.info(f"Wikipedia sentences: {len(wiki_dataset):,}")
-    logger.info(f"Epochs: {epochs}, Total steps: {total_steps}, Warmup: {warmup_steps}")
-    logger.info(f"Batch size: {batch_size}, AMP: {use_amp}, Device: {device}")
+    logger.info(f"Epochs: {epochs}, Batch steps: {total_batch_steps}, "
+                f"Scheduler optimizer steps: {total_steps}, Warmup: {warmup_steps}")
+    logger.info(f"Batch size: {batch_size}, Grad accumulation: {accumulation_steps}, "
+                f"Optimizer effective batch: {batch_size * accumulation_steps}, "
+                f"Contrastive negatives per batch: {batch_size - 1}, AMP: {use_amp}, Device: {device}")
+    if not debug:
+        sample_cap_text = f"{stage0_max_samples:,}" if stage0_max_samples else "none"
+        budget_text = format_duration(time_budget_seconds) if time_budget_seconds else "disabled"
+        logger.info(f"Budget target: {TRAIN_CONFIG.get('target_train_hours')}h total train | "
+                    f"Stage0 time budget: {budget_text} | Stage0 sample cap: {sample_cap_text}")
 
     # ===== TRAINING LOOP =====
     model.train()
     global_step = start_step
+    stage_start_time = time.time()
+    last_checkpoint_time = stage_start_time
+    stop_stage0 = False
 
     for epoch in range(start_epoch, epochs):
         epoch_loss = 0.0
         num_batches = 0
+        optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, batch in enumerate(train_loader):
+            elapsed = time.time() - stage_start_time
+            if time_budget_seconds is not None and elapsed >= time_budget_seconds:
+                logger.info(f"[Stage0-SimCSE] Time budget reached after "
+                            f"{format_duration(elapsed)} at step {global_step}.")
+                stop_stage0 = True
+                break
+
             if epoch == start_epoch and batch_idx < (start_step % len(train_loader)):
                 continue
 
             ids = batch['input_ids'].to(device)
             mask = batch['attention_mask'].to(device)
 
-            optimizer.zero_grad()
-
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            with autocast(device_type=device.type, enabled=use_amp):
                 # ===== CỐT LÕI CỦA SimCSE =====
                 # Cùng 1 input, encode 2 lần → Dropout khác nhau → 2 embeddings khác nhau
                 # (Gao et al., EMNLP 2021, Section 3.1)
@@ -299,23 +462,39 @@ def train_stage0_simcse(model, device, debug=True):
                 embedding_1 = model(ids, mask)  # h₁ = f(x, z₁) với z₁ = dropout mask 1
                 embedding_2 = model(ids, mask)  # h₂ = f(x, z₂) với z₂ = dropout mask 2
 
-                # MNR Loss: ép h₁ ≈ h₂ (cùng câu), đẩy h_i ≠ h_j (câu khác)
+                # Contrastive loss: ép h₁ ≈ h₂, đẩy h_i khỏi câu khác trong batch
                 loss = criterion(embedding_1, embedding_2)
 
+            raw_loss = loss.detach()
+            loss = loss / get_accumulation_divisor(batch_idx, len(train_loader), accumulation_steps)
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
 
-            epoch_loss += loss.item()
+            if should_step_optimizer(batch_idx, len(train_loader), accumulation_steps):
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            epoch_loss += raw_loss.item()
             num_batches += 1
             global_step += 1
 
-            if global_step % 100 == 0:
-                avg_loss = epoch_loss / num_batches
-                lr = scheduler.get_lr()
-                logger.info(f"[Stage0-SimCSE] Epoch {epoch+1}/{epochs} | Step {global_step} | "
-                           f"Loss: {avg_loss:.4f} | LR: {lr:.2e}")
+            if global_step % log_every == 0:
+                log_progress(
+                    "Stage0-SimCSE", epoch + 1, epochs, global_step,
+                    total_batch_steps, epoch_loss, num_batches,
+                    stage_start_time, scheduler.get_lr(),
+                    time_budget_seconds=time_budget_seconds
+                )
+
+            now = time.time()
+            if now - last_checkpoint_time >= checkpoint_interval_seconds:
+                avg_loss = epoch_loss / max(num_batches, 1)
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch, global_step, avg_loss,
+                    checkpoint_path
+                )
+                last_checkpoint_time = now
 
         # Evaluate
         spearman = evaluate_stsb(model, eval_loader, device)
@@ -325,6 +504,9 @@ def train_stage0_simcse(model, device, debug=True):
 
         save_checkpoint(model, optimizer, scheduler, epoch + 1, global_step, avg_loss,
                        checkpoint_path)
+
+        if stop_stage0:
+            break
 
     final_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage0_final.pt")
     torch.save(model.state_dict(), final_path)
@@ -364,6 +546,7 @@ def train_stage1_nli(model, device, debug=True):
     train_loader = create_dataloader(nli_dataset, batch_size=batch_size,
                                      shuffle=True, num_workers=num_workers,
                                      prefetch_factor=2 if num_workers > 0 else None)
+    accumulation_steps = get_gradient_accumulation_steps()
 
     # Evaluation
     eval_loader = _create_eval_loader(device, debug, cache_dir)
@@ -382,28 +565,43 @@ def train_stage1_nli(model, device, debug=True):
 
     # LR Schedule — Cosine Annealing with Warmup
     epochs = TRAIN_CONFIG["epochs_stage1"]
-    total_steps = len(train_loader) * epochs
+    update_steps_per_epoch = get_update_steps_per_epoch(len(train_loader), accumulation_steps)
+    total_steps = update_steps_per_epoch * epochs
     warmup_steps = int(TRAIN_CONFIG["warmup_ratio"] * total_steps)
     scheduler = CosineAnnealingWithWarmup(optimizer, warmup_steps, total_steps)
 
     # Mixed Precision — FP16 trên CUDA, FP32 trên MPS
     use_amp = TRAIN_CONFIG["use_amp_on_cuda"] and device.type == "cuda"
-    scaler = torch.amp.GradScaler(enabled=use_amp)
+    scaler = GradScaler(enabled=use_amp)
 
     # Resume from checkpoint
     checkpoint_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage1_latest.pt")
-    start_epoch, start_step = load_checkpoint(model, optimizer, scheduler, checkpoint_path, device)
+    previous_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage0_final.pt")
+    load_previous_stage_if_needed(model, checkpoint_path, previous_path, device,
+                                  "Stage1", "Stage0")
+    start_epoch, start_step = load_checkpoint(
+        model, optimizer, scheduler, checkpoint_path, device,
+        extra_modules={'criterion': criterion}
+    )
 
-    logger.info(f"Epochs: {epochs}, Total steps: {total_steps}, Warmup: {warmup_steps}")
-    logger.info(f"Batch size: {batch_size}, AMP: {use_amp}, Device: {device}")
+    total_batch_steps = len(train_loader) * epochs
+    log_every = get_progress_log_every_steps()
+
+    logger.info(f"Epochs: {epochs}, Batch steps: {total_batch_steps}, "
+                f"Optimizer steps: {total_steps}, Warmup: {warmup_steps}")
+    logger.info(f"Batch size: {batch_size}, Grad accumulation: {accumulation_steps}, "
+                f"Optimizer effective batch: {batch_size * accumulation_steps}, "
+                f"AMP: {use_amp}, Device: {device}")
 
     # ===== TRAINING LOOP =====
     model.train()
     global_step = start_step
+    stage_start_time = time.time()
 
     for epoch in range(start_epoch, epochs):
         epoch_loss = 0.0
         num_batches = 0
+        optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, batch in enumerate(train_loader):
             if epoch == start_epoch and batch_idx < (start_step % len(train_loader)):
@@ -417,9 +615,7 @@ def train_stage1_nli(model, device, debug=True):
             labels = batch['label'].to(device)
 
             # ===== Forward Pass =====
-            optimizer.zero_grad()
-
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            with autocast(device_type=device.type, enabled=use_amp):
                 # Encode 2 câu qua Siamese Encoder (chia sẻ trọng số)
                 embedding_a = model(ids_a, mask_a)  # (B, H)
                 embedding_b = model(ids_b, mask_b)  # (B, H)
@@ -428,23 +624,26 @@ def train_stage1_nli(model, device, debug=True):
                 loss = criterion(embedding_a, embedding_b, labels)
 
             # ===== Backward Pass =====
+            raw_loss = loss.detach()
+            loss = loss / get_accumulation_divisor(batch_idx, len(train_loader), accumulation_steps)
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
 
-            # LR Schedule step
-            scheduler.step()
+            if should_step_optimizer(batch_idx, len(train_loader), accumulation_steps):
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            epoch_loss += loss.item()
+            epoch_loss += raw_loss.item()
             num_batches += 1
             global_step += 1
 
-            # Log every 50 steps
-            if global_step % 50 == 0:
-                avg_loss = epoch_loss / num_batches
-                lr = scheduler.get_lr()
-                logger.info(f"[Stage1] Epoch {epoch+1}/{epochs} | Step {global_step} | "
-                           f"Loss: {avg_loss:.4f} | LR: {lr:.2e}")
+            if global_step % log_every == 0:
+                log_progress(
+                    "Stage1", epoch + 1, epochs, global_step,
+                    total_batch_steps, epoch_loss, num_batches,
+                    stage_start_time, scheduler.get_lr()
+                )
 
         # Evaluate after each epoch
         spearman = evaluate_stsb(model, eval_loader, device)
@@ -454,7 +653,7 @@ def train_stage1_nli(model, device, debug=True):
 
         # Save checkpoint
         save_checkpoint(model, optimizer, scheduler, epoch + 1, global_step, avg_loss,
-                       checkpoint_path)
+                       checkpoint_path, extra_modules={'criterion': criterion})
 
     # Save final model
     final_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage1_final.pt")
@@ -471,14 +670,14 @@ def train_stage2_similarity(model, device, debug=True, include_hard_negatives=Fa
     Giai đoạn 2: Similarity Fine-tune — Reimers & Gurevych, EMNLP 2019.
     Curriculum Learning Stage 2 (khó hơn) — Bengio et al., ICML 2009.
 
-    Mục tiêu: Tối ưu cosine similarity giữa các cặp câu tương đồng
-    Loss: MNR Loss (Multiple Negatives Ranking) — Henderson et al., 2017
-    Hard Negatives: PAWS — Zhang et al., NAACL 2019
+    Mục tiêu: Tối ưu embedding cho similarity/paraphrase.
+    - Stage2: SimCSE-style contrastive softmax trên positive pairs.
+    - Stage2+HN: SBERT SoftmaxLoss 2 lớp trên cặp PAWS paraphrase/non-paraphrase.
     """
     stage_name = "Stage2+HN" if include_hard_negatives else "Stage2"
     logger.info("=" * 60)
     logger.info(f"GIAI ĐOẠN 2: SIMILARITY TRAINING ({stage_name})")
-    logger.info("Paper: Henderson et al., 2017 (MNR) + Zhang et al., NAACL 2019 (PAWS)")
+    logger.info("Paper: Gao et al., EMNLP 2021 (contrastive) + Zhang et al., NAACL 2019 (PAWS)")
     logger.info("=" * 60)
 
     cache_dir = TRAIN_CONFIG.get("data_cache_dir")
@@ -498,16 +697,25 @@ def train_stage2_similarity(model, device, debug=True, include_hard_negatives=Fa
     train_loader = create_dataloader(sim_dataset, batch_size=batch_size,
                                      shuffle=True, num_workers=num_workers,
                                      prefetch_factor=2 if num_workers > 0 else None)
+    accumulation_steps = get_gradient_accumulation_steps()
 
     # Evaluation
     eval_loader = _create_eval_loader(device, debug, cache_dir)
 
-    # Loss — MNR Loss, Henderson et al., 2017
-    criterion = MultipleNegativesRankingLoss(temperature=TRAIN_CONFIG["temperature"])
+    # Loss
+    if include_hard_negatives:
+        # PAWS cung cấp pair labels, không phải triplets cùng anchor.
+        # Dùng supervised SBERT-style pair classification trên [u, v, |u-v|].
+        criterion = SoftmaxLoss(hidden_size=MODEL_CONFIG["hidden_size"], num_labels=2).to(device)
+    else:
+        criterion = MultipleNegativesRankingLoss(temperature=TRAIN_CONFIG["temperature"])
 
     # Optimizer — AdamW
+    optim_params = list(model.parameters())
+    if include_hard_negatives:
+        optim_params += list(criterion.parameters())
     optimizer = AdamW(
-        model.parameters(),
+        optim_params,
         lr=TRAIN_CONFIG["learning_rate"],
         betas=(TRAIN_CONFIG["adam_beta1"], TRAIN_CONFIG["adam_beta2"]),
         eps=TRAIN_CONFIG["adam_epsilon"],
@@ -516,29 +724,53 @@ def train_stage2_similarity(model, device, debug=True, include_hard_negatives=Fa
 
     # LR Schedule
     epochs = TRAIN_CONFIG["epochs_stage2"]
-    total_steps = len(train_loader) * epochs
+    update_steps_per_epoch = get_update_steps_per_epoch(len(train_loader), accumulation_steps)
+    total_steps = update_steps_per_epoch * epochs
     warmup_steps = int(TRAIN_CONFIG["warmup_ratio"] * total_steps)
     scheduler = CosineAnnealingWithWarmup(optimizer, warmup_steps, total_steps)
 
     # Mixed Precision
     use_amp = TRAIN_CONFIG["use_amp_on_cuda"] and device.type == "cuda"
-    scaler = torch.amp.GradScaler(enabled=use_amp)
+    scaler = GradScaler(enabled=use_amp)
 
     # Resume from checkpoint
     ckpt_name = "stage2_hn_latest.pt" if include_hard_negatives else "stage2_latest.pt"
     checkpoint_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], ckpt_name)
-    start_epoch, start_step = load_checkpoint(model, optimizer, scheduler, checkpoint_path, device)
+    previous_name = "stage2_final.pt" if include_hard_negatives else "stage1_final.pt"
+    previous_stage = "Stage2" if include_hard_negatives else "Stage1"
+    previous_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], previous_name)
+    load_previous_stage_if_needed(model, checkpoint_path, previous_path, device,
+                                  stage_name, previous_stage)
+    extra_modules = {'criterion': criterion} if include_hard_negatives else None
+    start_epoch, start_step = load_checkpoint(
+        model, optimizer, scheduler, checkpoint_path, device,
+        extra_modules=extra_modules
+    )
 
-    logger.info(f"Epochs: {epochs}, Total steps: {total_steps}, Warmup: {warmup_steps}")
-    logger.info(f"Batch size: {batch_size}, Temperature: {TRAIN_CONFIG['temperature']}")
+    total_batch_steps = len(train_loader) * epochs
+    log_every = get_progress_log_every_steps()
+
+    logger.info(f"Epochs: {epochs}, Batch steps: {total_batch_steps}, "
+                f"Optimizer steps: {total_steps}, Warmup: {warmup_steps}")
+    if include_hard_negatives:
+        logger.info(f"Batch size: {batch_size}, Grad accumulation: {accumulation_steps}, "
+                    f"Optimizer effective batch: {batch_size * accumulation_steps}, "
+                    "Objective: PAWS binary SoftmaxLoss")
+    else:
+        logger.info(f"Batch size: {batch_size}, Grad accumulation: {accumulation_steps}, "
+                    f"Optimizer effective batch: {batch_size * accumulation_steps}, "
+                    f"Contrastive negatives per batch: {batch_size - 1}, "
+                    f"Temperature: {TRAIN_CONFIG['temperature']}")
 
     # ===== TRAINING LOOP =====
     model.train()
     global_step = start_step
+    stage_start_time = time.time()
 
     for epoch in range(start_epoch, epochs):
         epoch_loss = 0.0
         num_batches = 0
+        optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, batch in enumerate(train_loader):
             if epoch == start_epoch and batch_idx < (start_step % len(train_loader)):
@@ -548,44 +780,40 @@ def train_stage2_similarity(model, device, debug=True, include_hard_negatives=Fa
             mask_a = batch['attention_mask_a'].to(device)
             ids_b = batch['input_ids_b'].to(device)
             mask_b = batch['attention_mask_b'].to(device)
+            labels = batch['label'].to(device) if include_hard_negatives else None
 
-            optimizer.zero_grad()
-
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            with autocast(device_type=device.type, enabled=use_amp):
                 # Encode anchor và positive
                 embedding_a = model(ids_a, mask_a)  # (B, H)
                 embedding_b = model(ids_b, mask_b)  # (B, H)
 
-                # MNR Loss: cosine similarity matrix + cross-entropy
-                loss = criterion(embedding_a, embedding_b)
+                if include_hard_negatives:
+                    # Supervised PAWS pair classification: paraphrase vs non-paraphrase.
+                    loss = criterion(embedding_a, embedding_b, labels)
+                else:
+                    # Contrastive loss: cosine similarity matrix + cross-entropy
+                    loss = criterion(embedding_a, embedding_b)
 
-                # Nếu có hard negatives, thêm loss cho (anchor, negative)
-                if include_hard_negatives and 'input_ids_neg' in batch:
-                    ids_neg = batch['input_ids_neg'].to(device)
-                    mask_neg = batch['attention_mask_neg'].to(device)
-
-                    # Encode negative
-                    embedding_neg = model(ids_neg, mask_neg)
-
-                    # Ghép negative vào positive pool → MNR Loss khó hơn
-                    all_positives = torch.cat([embedding_b, embedding_neg], dim=0)
-                    loss_hn = criterion(embedding_a, all_positives[:len(embedding_a)])
-                    loss = (loss + loss_hn) / 2.0
-
+            raw_loss = loss.detach()
+            loss = loss / get_accumulation_divisor(batch_idx, len(train_loader), accumulation_steps)
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
 
-            epoch_loss += loss.item()
+            if should_step_optimizer(batch_idx, len(train_loader), accumulation_steps):
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            epoch_loss += raw_loss.item()
             num_batches += 1
             global_step += 1
 
-            if global_step % 50 == 0:
-                avg_loss = epoch_loss / num_batches
-                lr = scheduler.get_lr()
-                logger.info(f"[{stage_name}] Epoch {epoch+1}/{epochs} | Step {global_step} | "
-                           f"Loss: {avg_loss:.4f} | LR: {lr:.2e}")
+            if global_step % log_every == 0:
+                log_progress(
+                    stage_name, epoch + 1, epochs, global_step,
+                    total_batch_steps, epoch_loss, num_batches,
+                    stage_start_time, scheduler.get_lr()
+                )
 
         spearman = evaluate_stsb(model, eval_loader, device)
         avg_loss = epoch_loss / max(num_batches, 1)
@@ -593,7 +821,7 @@ def train_stage2_similarity(model, device, debug=True, include_hard_negatives=Fa
                    f"Avg Loss: {avg_loss:.4f} | STS-B Spearman: {spearman:.4f}")
 
         save_checkpoint(model, optimizer, scheduler, epoch + 1, global_step, avg_loss,
-                       checkpoint_path)
+                       checkpoint_path, extra_modules=extra_modules)
 
     final_name = "stage2_hn_final.pt" if include_hard_negatives else "stage2_final.pt"
     final_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], final_name)
@@ -631,7 +859,7 @@ def main():
     # Giai đoạn 1: NLI
     train_stage1_nli(model, device, debug=debug)
 
-    # Giai đoạn 2: Similarity (MNR Loss) trên PAWS
+    # Giai đoạn 2: Similarity contrastive learning trên PAWS
     train_stage2_similarity(model, device, debug=debug, include_hard_negatives=False)
 
     # Giai đoạn 2+: Similarity + Hard Negatives (PAWS adversarial)
