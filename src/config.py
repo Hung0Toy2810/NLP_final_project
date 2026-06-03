@@ -125,6 +125,10 @@ TRAIN_CONFIG = {
     # --- Checkpoint ---
     "checkpoint_dir": os.environ.get("SWFT_CHECKPOINT_DIR", "./checkpoints"),
     "save_every_epoch": True,      # Lưu checkpoint mỗi epoch — BẮT BUỘC cho resume
+    "metrics_log_path": os.environ.get(
+        "SWFT_METRICS_LOG",
+        os.path.join(os.environ.get("SWFT_CHECKPOINT_DIR", "./checkpoints"), "train_metrics.jsonl")
+    ),
 
     # --- Data Cache (Pre-tokenized, Apache Arrow) ---
     "data_cache_dir": os.environ.get("SWFT_CACHE_DIR", "./data_cache"),

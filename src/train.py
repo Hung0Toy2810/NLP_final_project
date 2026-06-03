@@ -24,6 +24,7 @@ import sys
 import logging
 import math
 import time
+import shutil
 import torch
 import torch.nn as nn
 from typing import Optional
@@ -42,6 +43,7 @@ from dataset import (
     get_tokenizer, WikipediaDistillationDataset, NLIDataset, SimilarityDataset,
     STSBDataset, create_dataloader
 )
+from training_log import init_training_logger, log_event
 
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
@@ -105,7 +107,8 @@ class CosineAnnealingWithWarmup:
 # =============================================================================
 
 def save_checkpoint(model, optimizer, scheduler, epoch, step, loss, path,
-                    extra_modules: Optional[dict] = None):
+                    extra_modules: Optional[dict] = None,
+                    stage_name: Optional[str] = None):
     """
     Lưu checkpoint để resume training.
     BẮT BUỘC khi train trên cloud (session có thể bị ngắt bất cứ lúc nào).
@@ -126,6 +129,14 @@ def save_checkpoint(model, optimizer, scheduler, epoch, step, loss, path,
         }
     torch.save(checkpoint, path)
     logger.info(f" Checkpoint saved: {path} (epoch={epoch}, step={step}, loss={loss:.4f})")
+    log_event(
+        "checkpoint",
+        stage=stage_name,
+        epoch=epoch,
+        global_step=step,
+        loss=float(loss),
+        path=path,
+    )
 
 
 def load_checkpoint(model, optimizer, scheduler, path, device,
@@ -209,6 +220,23 @@ def format_duration(seconds: float) -> str:
     if minutes:
         return f"{minutes}m{seconds:02d}s"
     return f"{seconds}s"
+
+
+def get_disk_usage(path: Optional[str]) -> dict:
+    """Return disk usage for the filesystem containing path."""
+    target = path or "."
+    if not os.path.exists(target):
+        target = os.path.dirname(target) or "."
+    try:
+        usage = shutil.disk_usage(target)
+        return {
+            "disk_total_gb": usage.total / 1e9,
+            "disk_used_gb": usage.used / 1e9,
+            "disk_free_gb": usage.free / 1e9,
+            "disk_used_pct": usage.used / max(usage.total, 1) * 100.0,
+        }
+    except OSError:
+        return {}
 
 
 def get_progress_log_every_steps() -> int:
@@ -333,6 +361,20 @@ def log_progress(stage_name: str, epoch: int, epochs: int, global_step: int,
     if budget_left is not None:
         msg += f" | Budget left: {format_duration(budget_left)}"
     logger.info(msg)
+    log_event(
+        "progress",
+        stage=stage_name,
+        epoch=epoch,
+        epochs=epochs,
+        global_step=global_step,
+        total_batch_steps=total_batch_steps,
+        avg_loss=avg_loss,
+        lr=lr,
+        batches_per_sec=batches_per_sec,
+        elapsed_sec=elapsed,
+        eta_sec=eta,
+        budget_left_sec=budget_left,
+    )
 
 
 # =============================================================================
@@ -498,6 +540,22 @@ def train_stage0_distillation(model, device, debug=True):
         budget_text = format_duration(time_budget_seconds) if time_budget_seconds else "disabled"
         logger.info(f"Budget target: {TRAIN_CONFIG.get('target_train_hours')}h total train | "
                     f"Stage0 time budget: {budget_text} | Stage0 sample cap: {sample_cap_text}")
+    log_event(
+        "stage_start",
+        stage=stage_log_name,
+        epochs=epochs,
+        total_batch_steps=total_batch_steps,
+        scheduler_steps=total_steps,
+        warmup_steps=warmup_steps,
+        batch_size=batch_size,
+        gradient_accumulation_steps=accumulation_steps,
+        use_amp=use_amp,
+        device=str(device),
+        debug=debug,
+        time_budget_sec=time_budget_seconds,
+        teacher_model=TRAIN_CONFIG["stage0_teacher_model"],
+        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
+    )
 
     # ===== TRAINING LOOP =====
     model.train()
@@ -564,7 +622,8 @@ def train_stage0_distillation(model, device, debug=True):
                 avg_loss = epoch_loss / max(num_batches, 1)
                 save_checkpoint(
                     model, optimizer, scheduler, epoch, global_step, avg_loss,
-                    checkpoint_path
+                    checkpoint_path,
+                    stage_name=stage_log_name
                 )
                 last_checkpoint_time = now
 
@@ -573,9 +632,21 @@ def train_stage0_distillation(model, device, debug=True):
         avg_loss = epoch_loss / max(num_batches, 1)
         logger.info(f"[{stage_log_name}] Epoch {epoch+1}/{epochs} DONE | "
                    f"Avg Loss: {avg_loss:.4f} | STS-B Spearman: {spearman:.4f}")
+        log_event(
+            "epoch_end",
+            stage=stage_log_name,
+            epoch=epoch + 1,
+            epochs=epochs,
+            global_step=global_step,
+            avg_loss=avg_loss,
+            stsb_spearman=spearman,
+            lr=scheduler.get_lr(),
+            elapsed_sec=time.time() - stage_start_time,
+            **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
+        )
 
         save_checkpoint(model, optimizer, scheduler, epoch + 1, global_step, avg_loss,
-                       checkpoint_path)
+                       checkpoint_path, stage_name=stage_log_name)
 
         if stop_stage0:
             break
@@ -583,6 +654,14 @@ def train_stage0_distillation(model, device, debug=True):
     final_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage0_final.pt")
     torch.save(model.state_dict(), final_path)
     logger.info(f" Giai đoạn 0 hoàn thành. Model saved: {final_path}")
+    log_event(
+        "stage_end",
+        stage=stage_log_name,
+        final_model_path=final_path,
+        global_step=global_step,
+        elapsed_sec=time.time() - stage_start_time,
+        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
+    )
 
 
 # =============================================================================
@@ -664,6 +743,20 @@ def train_stage1_nli(model, device, debug=True):
     logger.info(f"Batch size: {batch_size}, Grad accumulation: {accumulation_steps}, "
                 f"Optimizer effective batch: {batch_size * accumulation_steps}, "
                 f"AMP: {use_amp}, Device: {device}")
+    log_event(
+        "stage_start",
+        stage="Stage1",
+        epochs=epochs,
+        total_batch_steps=total_batch_steps,
+        scheduler_steps=total_steps,
+        warmup_steps=warmup_steps,
+        batch_size=batch_size,
+        gradient_accumulation_steps=accumulation_steps,
+        use_amp=use_amp,
+        device=str(device),
+        debug=debug,
+        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
+    )
 
     # ===== TRAINING LOOP =====
     model.train()
@@ -722,15 +815,36 @@ def train_stage1_nli(model, device, debug=True):
         avg_loss = epoch_loss / max(num_batches, 1)
         logger.info(f"[Stage1] Epoch {epoch+1}/{epochs} DONE | "
                    f"Avg Loss: {avg_loss:.4f} | STS-B Spearman: {spearman:.4f}")
+        log_event(
+            "epoch_end",
+            stage="Stage1",
+            epoch=epoch + 1,
+            epochs=epochs,
+            global_step=global_step,
+            avg_loss=avg_loss,
+            stsb_spearman=spearman,
+            lr=scheduler.get_lr(),
+            elapsed_sec=time.time() - stage_start_time,
+            **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
+        )
 
         # Save checkpoint
         save_checkpoint(model, optimizer, scheduler, epoch + 1, global_step, avg_loss,
-                       checkpoint_path, extra_modules={'criterion': criterion})
+                       checkpoint_path, extra_modules={'criterion': criterion},
+                       stage_name="Stage1")
 
     # Save final model
     final_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage1_final.pt")
     torch.save(model.state_dict(), final_path)
     logger.info(f" Giai đoạn 1 hoàn thành. Model saved: {final_path}")
+    log_event(
+        "stage_end",
+        stage="Stage1",
+        final_model_path=final_path,
+        global_step=global_step,
+        elapsed_sec=time.time() - stage_start_time,
+        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
+    )
 
 
 # =============================================================================
@@ -833,6 +947,21 @@ def train_stage2_similarity(model, device, debug=True, include_hard_negatives=Fa
                     f"Optimizer effective batch: {batch_size * accumulation_steps}, "
                     f"Contrastive negatives per batch: {batch_size - 1}, "
                     f"Temperature: {TRAIN_CONFIG['temperature']}")
+    log_event(
+        "stage_start",
+        stage=stage_name,
+        epochs=epochs,
+        total_batch_steps=total_batch_steps,
+        scheduler_steps=total_steps,
+        warmup_steps=warmup_steps,
+        batch_size=batch_size,
+        gradient_accumulation_steps=accumulation_steps,
+        use_amp=use_amp,
+        device=str(device),
+        debug=debug,
+        hard_negatives=include_hard_negatives,
+        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
+    )
 
     # ===== TRAINING LOOP =====
     model.train()
@@ -891,14 +1020,37 @@ def train_stage2_similarity(model, device, debug=True, include_hard_negatives=Fa
         avg_loss = epoch_loss / max(num_batches, 1)
         logger.info(f"[{stage_name}] Epoch {epoch+1}/{epochs} DONE | "
                    f"Avg Loss: {avg_loss:.4f} | STS-B Spearman: {spearman:.4f}")
+        log_event(
+            "epoch_end",
+            stage=stage_name,
+            epoch=epoch + 1,
+            epochs=epochs,
+            global_step=global_step,
+            avg_loss=avg_loss,
+            stsb_spearman=spearman,
+            lr=scheduler.get_lr(),
+            elapsed_sec=time.time() - stage_start_time,
+            hard_negatives=include_hard_negatives,
+            **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
+        )
 
         save_checkpoint(model, optimizer, scheduler, epoch + 1, global_step, avg_loss,
-                       checkpoint_path, extra_modules=extra_modules)
+                       checkpoint_path, extra_modules=extra_modules,
+                       stage_name=stage_name)
 
     final_name = "stage2_hn_final.pt" if include_hard_negatives else "stage2_final.pt"
     final_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], final_name)
     torch.save(model.state_dict(), final_path)
     logger.info(f" Giai đoạn 2 ({stage_name}) hoàn thành. Model saved: {final_path}")
+    log_event(
+        "stage_end",
+        stage=stage_name,
+        final_model_path=final_path,
+        global_step=global_step,
+        elapsed_sec=time.time() - stage_start_time,
+        hard_negatives=include_hard_negatives,
+        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
+    )
 
 
 # =============================================================================
@@ -908,17 +1060,35 @@ def train_stage2_similarity(model, device, debug=True, include_hard_negatives=Fa
 def main():
     device = get_device()
     debug = DEBUG_CONFIG["enabled"]
+    metrics_log_path = str(TRAIN_CONFIG["metrics_log_path"])
+    init_training_logger(metrics_log_path)
 
     logger.info("=" * 60)
     logger.info("SWFT — Shallow-Wide Factorized Transformer")
     logger.info("Train from scratch — Pure PyTorch")
     logger.info(f"Device: {device} | Debug: {debug}")
+    logger.info(f"Metrics JSONL: {metrics_log_path}")
     logger.info("=" * 60)
 
     # Tạo model
     model = create_swft_model(MODEL_CONFIG).to(device)
     total_params = model.count_parameters()
     logger.info(f"Tổng tham số: {total_params:,} (~{total_params/1e6:.1f}M)")
+    log_event(
+        "training_start",
+        device=str(device),
+        debug=debug,
+        total_params=total_params,
+        metrics_log_path=metrics_log_path,
+        checkpoint_dir=TRAIN_CONFIG["checkpoint_dir"],
+        data_cache_dir=TRAIN_CONFIG["data_cache_dir"],
+        target_train_hours=TRAIN_CONFIG["target_train_hours"],
+        stage0_time_budget_hours=TRAIN_CONFIG["stage0_time_budget_hours"],
+        batch_size=TRAIN_CONFIG["batch_size_debug"] if debug else TRAIN_CONFIG["batch_size_train"],
+        gradient_accumulation_steps=TRAIN_CONFIG["gradient_accumulation_steps"],
+        stage0_teacher_model=TRAIN_CONFIG["stage0_teacher_model"],
+        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
+    )
 
     # ===== Curriculum Learning (Bengio et al., ICML 2009) =====
     # Stage 0: supervised teacher-student distillation từ text thô
@@ -938,6 +1108,11 @@ def main():
     train_stage2_similarity(model, device, debug=debug, include_hard_negatives=True)
 
     logger.info("🎉 HOÀN THÀNH TOÀN BỘ PIPELINE TRAINING!")
+    log_event(
+        "training_complete",
+        checkpoint_dir=TRAIN_CONFIG["checkpoint_dir"],
+        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
+    )
 
 
 if __name__ == "__main__":
