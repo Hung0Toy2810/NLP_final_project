@@ -66,11 +66,12 @@ MODEL_CONFIG = {
 
 BUDGET_CONFIG = {
     # RunPod L40S budget plan:
-    # GPU: $0.86/h, total budget: $50.
+    # GPU: $0.86/h + container disk ~$0.004/h, total budget: $50.
     # Network Volume 150GB for 3 days: 150 * $0.07/GB/month * 3/30 = ~$1.05.
-    # Reserve $0.75 for billing jitter/setup overhead, leaving ~$48.20 GPU time.
+    # Reserve $0.75 for billing jitter/setup overhead.
     "total_budget_usd": float(os.environ.get("SWFT_TOTAL_BUDGET_USD", "50")),
     "gpu_usd_per_hour": float(os.environ.get("SWFT_GPU_USD_PER_HOUR", "0.86")),
+    "container_disk_usd_per_hour": float(os.environ.get("SWFT_CONTAINER_DISK_USD_PER_HOUR", "0.004")),
     "storage_gb": float(os.environ.get("SWFT_STORAGE_GB", "150")),
     "storage_usd_per_gb_month": float(os.environ.get("SWFT_STORAGE_USD_PER_GB_MONTH", "0.07")),
     "storage_days": float(os.environ.get("SWFT_STORAGE_DAYS", "3")),
@@ -94,7 +95,11 @@ def _default_target_train_hours() -> float:
         - _storage_cost_usd()
         - BUDGET_CONFIG["budget_safety_usd"]
     )
-    gpu_hours = available_gpu_usd / max(BUDGET_CONFIG["gpu_usd_per_hour"], 1e-9)
+    hourly_runtime_cost = (
+        BUDGET_CONFIG["gpu_usd_per_hour"]
+        + BUDGET_CONFIG["container_disk_usd_per_hour"]
+    )
+    gpu_hours = available_gpu_usd / max(hourly_runtime_cost, 1e-9)
     return math.floor(gpu_hours * 10.0) / 10.0
 
 
@@ -132,8 +137,9 @@ TRAIN_CONFIG = {
     "epochs_stage2": 4,            # Stage 2: Similarity fine-tune
 
     # --- Training Budget ---
-    # Default theo phương án L40S $0.86/h, tổng $50, có tính 150GB storage/3 ngày:
-    # ~56 giờ tổng, Stage 0 KD ~40 giờ, phần còn lại cho Stage 1/2 và dự phòng.
+    # Default theo phương án L40S $0.86/h + container disk $0.004/h,
+    # tổng $50, có tính 150GB storage/3 ngày:
+    # ~55.7 giờ tổng, Stage 0 KD ~39.8 giờ, phần còn lại cho Stage 1/2 và dự phòng.
     # Có thể override bằng env khi chuyển GPU hoặc cần siết chi phí.
     "target_train_hours": float(os.environ.get("SWFT_TARGET_TRAIN_HOURS", str(DEFAULT_TARGET_TRAIN_HOURS))),
     "stage0_time_budget_hours": float(os.environ.get("SWFT_STAGE0_TIME_BUDGET_HOURS", str(DEFAULT_STAGE0_TIME_BUDGET_HOURS))),

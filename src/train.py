@@ -384,6 +384,13 @@ def estimate_storage_cost_usd() -> float:
     )
 
 
+def estimate_hourly_runtime_cost_usd() -> float:
+    return (
+        float(BUDGET_CONFIG["gpu_usd_per_hour"])
+        + float(BUDGET_CONFIG["container_disk_usd_per_hour"])
+    )
+
+
 def get_stage0_scheduler_steps(num_batches: int, accumulation_steps: int,
                                time_budget_seconds) -> int:
     """
@@ -1375,6 +1382,7 @@ def main():
         else None
     )
     storage_cost_usd = estimate_storage_cost_usd()
+    hourly_runtime_cost_usd = estimate_hourly_runtime_cost_usd()
 
     logger.info("=" * 60)
     logger.info("SWFT — Shallow-Wide Factorized Transformer")
@@ -1384,10 +1392,13 @@ def main():
     logger.info(f"Text log: {text_log_path}")
     if total_budget_seconds is not None:
         logger.info(
-            "Global train timer: %s | GPU $%.2f/h | Storage %.0fGB/%sd ~= $%.2f | "
+            "Global train timer: %s | Runtime $%.3f/h (GPU $%.3f/h + container disk $%.3f/h) | "
+            "Storage %.0fGB/%sd ~= $%.2f | "
             "Safety buffer $%.2f",
             format_duration(total_budget_seconds),
+            hourly_runtime_cost_usd,
             float(BUDGET_CONFIG["gpu_usd_per_hour"]),
+            float(BUDGET_CONFIG["container_disk_usd_per_hour"]),
             float(BUDGET_CONFIG["storage_gb"]),
             BUDGET_CONFIG["storage_days"],
             storage_cost_usd,
@@ -1413,6 +1424,8 @@ def main():
         total_budget_sec=total_budget_seconds,
         budget_total_usd=BUDGET_CONFIG["total_budget_usd"],
         budget_gpu_usd_per_hour=BUDGET_CONFIG["gpu_usd_per_hour"],
+        budget_container_disk_usd_per_hour=BUDGET_CONFIG["container_disk_usd_per_hour"],
+        budget_runtime_usd_per_hour=hourly_runtime_cost_usd,
         budget_storage_gb=BUDGET_CONFIG["storage_gb"],
         budget_storage_days=BUDGET_CONFIG["storage_days"],
         budget_storage_estimated_usd=storage_cost_usd,
