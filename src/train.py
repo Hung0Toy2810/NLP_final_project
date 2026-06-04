@@ -35,7 +35,7 @@ from torch.amp import GradScaler, autocast  # pyright: ignore[reportPrivateImpor
 # Thêm src vào path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import MODEL_CONFIG, TRAIN_CONFIG, DEBUG_CONFIG, DATA_CONFIG, get_device
+from config import MODEL_CONFIG, TRAIN_CONFIG, DEBUG_CONFIG, DATA_CONFIG, BUDGET_CONFIG, get_device
 from model.sbert import create_swft_model
 from losses import (
     SoftmaxLoss, MultipleNegativesRankingLoss, Stage0TeacherDistillationLoss
@@ -319,6 +319,71 @@ def get_stage0_time_budget_seconds(debug: bool):
     return hours * 3600.0
 
 
+def get_total_train_budget_seconds(debug: bool):
+    """Wall-clock budget cho toàn pipeline; tắt trong debug."""
+    if debug:
+        return None
+    hours = float(TRAIN_CONFIG.get("target_train_hours", 0))
+    if hours <= 0:
+        return None
+    return hours * 3600.0
+
+
+def global_training_budget_reached(training_deadline: Optional[float]) -> bool:
+    return training_deadline is not None and time.time() >= training_deadline
+
+
+def get_global_budget_left_seconds(training_deadline: Optional[float]) -> Optional[float]:
+    if training_deadline is None:
+        return None
+    return max(0.0, training_deadline - time.time())
+
+
+def log_training_budget_stop(stage_name: str, global_step: int,
+                             training_deadline: Optional[float]) -> None:
+    budget_left = get_global_budget_left_seconds(training_deadline)
+    logger.info(
+        "[%s] Global training budget reached at step %s. Stopping pipeline.",
+        stage_name,
+        global_step,
+    )
+    log_event(
+        "training_budget_stop",
+        stage=stage_name,
+        global_step=global_step,
+        global_budget_left_sec=budget_left,
+        checkpoint_dir=TRAIN_CONFIG["checkpoint_dir"],
+        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
+    )
+
+
+def log_pipeline_stopped_by_budget(stage_name: str, pipeline_start_time: float,
+                                   total_budget_seconds: Optional[float]) -> None:
+    elapsed = time.time() - pipeline_start_time
+    logger.info(
+        "Pipeline stopped by global budget after %s at %s.",
+        format_duration(elapsed),
+        stage_name,
+    )
+    log_event(
+        "training_stopped_budget",
+        stage=stage_name,
+        elapsed_sec=elapsed,
+        total_budget_sec=total_budget_seconds,
+        checkpoint_dir=TRAIN_CONFIG["checkpoint_dir"],
+        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
+    )
+
+
+def estimate_storage_cost_usd() -> float:
+    return (
+        float(BUDGET_CONFIG["storage_gb"])
+        * float(BUDGET_CONFIG["storage_usd_per_gb_month"])
+        * float(BUDGET_CONFIG["storage_days"])
+        / 30.0
+    )
+
+
 def get_stage0_scheduler_steps(num_batches: int, accumulation_steps: int,
                                time_budget_seconds) -> int:
     """
@@ -543,7 +608,8 @@ def _create_eval_loader(device, debug, cache_dir):
 #   3. Loss = 1 - cosine(normalize(student), normalize(teacher)).
 #   4. Teacher chạy eval/no_grad; backward chỉ cập nhật student.
 
-def train_stage0_distillation(model, device, debug=True):
+def train_stage0_distillation(model, device, debug=True,
+                              training_deadline: Optional[float] = None) -> bool:
     """
     Giai đoạn 0: supervised direct teacher-student distillation.
     Curriculum Learning Stage 0 (dễ nhất) — Bengio et al., ICML 2009.
@@ -697,6 +763,7 @@ def train_stage0_distillation(model, device, debug=True):
     stage_start_time = time.time()
     last_checkpoint_time = stage_start_time
     stop_stage0 = False
+    stop_pipeline_budget = False
 
     for epoch in range(start_epoch, epochs):
         epoch_loss = 0.0
@@ -704,6 +771,17 @@ def train_stage0_distillation(model, device, debug=True):
         optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, batch in enumerate(train_loader):
+            if global_training_budget_reached(training_deadline):
+                avg_loss = epoch_loss / max(num_batches, 1)
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch, global_step, avg_loss,
+                    checkpoint_path,
+                    stage_name=stage_log_name
+                )
+                log_training_budget_stop(stage_log_name, global_step, training_deadline)
+                stop_pipeline_budget = True
+                break
+
             elapsed = time.time() - stage_start_time
             if time_budget_seconds is not None and elapsed >= time_budget_seconds:
                 logger.info(f"[{stage_log_name}] Time budget reached after "
@@ -760,6 +838,9 @@ def train_stage0_distillation(model, device, debug=True):
                     stage_name=stage_log_name
                 )
                 last_checkpoint_time = now
+
+        if stop_pipeline_budget:
+            return False
 
         # Evaluate held-out Wikipedia distillation split first. This split is
         # never used by the train DataLoader, so it detects Stage 0 memorization.
@@ -824,13 +905,15 @@ def train_stage0_distillation(model, device, debug=True):
         elapsed_sec=time.time() - stage_start_time,
         **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
     )
+    return True
 
 
 # =============================================================================
 # GIAI ĐOẠN 1: NLI TRAINING
 # =============================================================================
 
-def train_stage1_nli(model, device, debug=True):
+def train_stage1_nli(model, device, debug=True,
+                     training_deadline: Optional[float] = None) -> bool:
     """
     Giai đoạn 1: NLI Fine-tune — Reimers & Gurevych, EMNLP 2019.
     Curriculum Learning Stage 1 (dễ) — Bengio et al., ICML 2009.
@@ -929,6 +1012,7 @@ def train_stage1_nli(model, device, debug=True):
     global_step = start_step
     stage_start_time = time.time()
     last_checkpoint_time = stage_start_time
+    stop_pipeline_budget = False
 
     for epoch in range(start_epoch, epochs):
         epoch_loss = 0.0
@@ -936,6 +1020,16 @@ def train_stage1_nli(model, device, debug=True):
         optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, batch in enumerate(train_loader):
+            if global_training_budget_reached(training_deadline):
+                avg_loss_so_far = epoch_loss / max(num_batches, 1)
+                save_checkpoint(model, optimizer, scheduler, epoch, global_step,
+                                avg_loss_so_far, checkpoint_path,
+                                extra_modules={'criterion': criterion},
+                                stage_name="Stage1")
+                log_training_budget_stop("Stage1", global_step, training_deadline)
+                stop_pipeline_budget = True
+                break
+
             if epoch == start_epoch and batch_idx < (start_step % len(train_loader)):
                 continue  # Skip batches already processed
 
@@ -986,6 +1080,9 @@ def train_stage1_nli(model, device, debug=True):
                                 stage_name="Stage1")
                 last_checkpoint_time = now
 
+        if stop_pipeline_budget:
+            return False
+
         # Evaluate after each epoch
         spearman = evaluate_stsb(model, eval_loader, device)
         avg_loss = epoch_loss / max(num_batches, 1)
@@ -1021,13 +1118,15 @@ def train_stage1_nli(model, device, debug=True):
         elapsed_sec=time.time() - stage_start_time,
         **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
     )
+    return True
 
 
 # =============================================================================
 # GIAI ĐOẠN 2: SIMILARITY TRAINING (Contrastive Learning)
 # =============================================================================
 
-def train_stage2_similarity(model, device, debug=True, include_hard_negatives=False):
+def train_stage2_similarity(model, device, debug=True, include_hard_negatives=False,
+                            training_deadline: Optional[float] = None) -> bool:
     """
     Giai đoạn 2: Similarity Fine-tune — Reimers & Gurevych, EMNLP 2019.
     Curriculum Learning Stage 2 (khó hơn) — Bengio et al., ICML 2009.
@@ -1148,6 +1247,7 @@ def train_stage2_similarity(model, device, debug=True, include_hard_negatives=Fa
     global_step = start_step
     stage_start_time = time.time()
     last_checkpoint_time = stage_start_time
+    stop_pipeline_budget = False
 
     for epoch in range(start_epoch, epochs):
         epoch_loss = 0.0
@@ -1155,6 +1255,16 @@ def train_stage2_similarity(model, device, debug=True, include_hard_negatives=Fa
         optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, batch in enumerate(train_loader):
+            if global_training_budget_reached(training_deadline):
+                avg_loss_so_far = epoch_loss / max(num_batches, 1)
+                save_checkpoint(model, optimizer, scheduler, epoch, global_step,
+                                avg_loss_so_far, checkpoint_path,
+                                extra_modules=extra_modules,
+                                stage_name=stage_name)
+                log_training_budget_stop(stage_name, global_step, training_deadline)
+                stop_pipeline_budget = True
+                break
+
             if epoch == start_epoch and batch_idx < (start_step % len(train_loader)):
                 continue
 
@@ -1206,6 +1316,9 @@ def train_stage2_similarity(model, device, debug=True, include_hard_negatives=Fa
                                 stage_name=stage_name)
                 last_checkpoint_time = now
 
+        if stop_pipeline_budget:
+            return False
+
         spearman = evaluate_stsb(model, eval_loader, device)
         avg_loss = epoch_loss / max(num_batches, 1)
         logger.info(f"[{stage_name}] Epoch {epoch+1}/{epochs} DONE | "
@@ -1241,6 +1354,7 @@ def train_stage2_similarity(model, device, debug=True, include_hard_negatives=Fa
         hard_negatives=include_hard_negatives,
         **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
     )
+    return True
 
 
 # =============================================================================
@@ -1248,11 +1362,19 @@ def train_stage2_similarity(model, device, debug=True, include_hard_negatives=Fa
 # =============================================================================
 
 def main():
+    pipeline_start_time = time.time()
     device = get_device()
     debug = DEBUG_CONFIG["enabled"]
     metrics_log_path = str(TRAIN_CONFIG["metrics_log_path"])
     text_log_path = configure_file_logging(str(TRAIN_CONFIG["checkpoint_dir"]))
     init_training_logger(metrics_log_path)
+    total_budget_seconds = get_total_train_budget_seconds(debug)
+    training_deadline = (
+        pipeline_start_time + total_budget_seconds
+        if total_budget_seconds is not None
+        else None
+    )
+    storage_cost_usd = estimate_storage_cost_usd()
 
     logger.info("=" * 60)
     logger.info("SWFT — Shallow-Wide Factorized Transformer")
@@ -1260,6 +1382,17 @@ def main():
     logger.info(f"Device: {device} | Debug: {debug}")
     logger.info(f"Metrics JSONL: {metrics_log_path}")
     logger.info(f"Text log: {text_log_path}")
+    if total_budget_seconds is not None:
+        logger.info(
+            "Global train timer: %s | GPU $%.2f/h | Storage %.0fGB/%sd ~= $%.2f | "
+            "Safety buffer $%.2f",
+            format_duration(total_budget_seconds),
+            float(BUDGET_CONFIG["gpu_usd_per_hour"]),
+            float(BUDGET_CONFIG["storage_gb"]),
+            BUDGET_CONFIG["storage_days"],
+            storage_cost_usd,
+            float(BUDGET_CONFIG["budget_safety_usd"]),
+        )
     logger.info("=" * 60)
 
     # Tạo model
@@ -1277,6 +1410,13 @@ def main():
         data_cache_dir=TRAIN_CONFIG["data_cache_dir"],
         target_train_hours=TRAIN_CONFIG["target_train_hours"],
         stage0_time_budget_hours=TRAIN_CONFIG["stage0_time_budget_hours"],
+        total_budget_sec=total_budget_seconds,
+        budget_total_usd=BUDGET_CONFIG["total_budget_usd"],
+        budget_gpu_usd_per_hour=BUDGET_CONFIG["gpu_usd_per_hour"],
+        budget_storage_gb=BUDGET_CONFIG["storage_gb"],
+        budget_storage_days=BUDGET_CONFIG["storage_days"],
+        budget_storage_estimated_usd=storage_cost_usd,
+        budget_safety_usd=BUDGET_CONFIG["budget_safety_usd"],
         batch_size=TRAIN_CONFIG["batch_size_debug"] if debug else TRAIN_CONFIG["batch_size_train"],
         gradient_accumulation_steps=TRAIN_CONFIG["gradient_accumulation_steps"],
         stage0_teacher_model=TRAIN_CONFIG["stage0_teacher_model"],
@@ -1289,25 +1429,45 @@ def main():
     # Stage 2: Similarity + Hard Negatives (khó nhất — contrastive)
 
     # Giai đoạn 0: supervised distillation trên Wikipedia
-    train_stage0_distillation(model, device, debug=debug)
+    if not train_stage0_distillation(model, device, debug=debug,
+                                     training_deadline=training_deadline):
+        cleanup_after_stage(device, "Stage0")
+        log_pipeline_stopped_by_budget("Stage0", pipeline_start_time, total_budget_seconds)
+        return
     cleanup_after_stage(device, "Stage0")
 
     # Giai đoạn 1: NLI
-    train_stage1_nli(model, device, debug=debug)
+    if not train_stage1_nli(model, device, debug=debug,
+                            training_deadline=training_deadline):
+        cleanup_after_stage(device, "Stage1")
+        log_pipeline_stopped_by_budget("Stage1", pipeline_start_time, total_budget_seconds)
+        return
     cleanup_after_stage(device, "Stage1")
 
     # Giai đoạn 2: Similarity contrastive learning trên PAWS
-    train_stage2_similarity(model, device, debug=debug, include_hard_negatives=False)
+    if not train_stage2_similarity(model, device, debug=debug,
+                                   include_hard_negatives=False,
+                                   training_deadline=training_deadline):
+        cleanup_after_stage(device, "Stage2")
+        log_pipeline_stopped_by_budget("Stage2", pipeline_start_time, total_budget_seconds)
+        return
     cleanup_after_stage(device, "Stage2")
 
     # Giai đoạn 2+: Similarity + Hard Negatives (PAWS adversarial)
-    train_stage2_similarity(model, device, debug=debug, include_hard_negatives=True)
+    if not train_stage2_similarity(model, device, debug=debug,
+                                   include_hard_negatives=True,
+                                   training_deadline=training_deadline):
+        cleanup_after_stage(device, "Stage2+HN")
+        log_pipeline_stopped_by_budget("Stage2+HN", pipeline_start_time, total_budget_seconds)
+        return
     cleanup_after_stage(device, "Stage2+HN")
 
     logger.info("🎉 HOÀN THÀNH TOÀN BỘ PIPELINE TRAINING!")
     log_event(
         "training_complete",
         checkpoint_dir=TRAIN_CONFIG["checkpoint_dir"],
+        elapsed_sec=time.time() - pipeline_start_time,
+        total_budget_sec=total_budget_seconds,
         **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
     )
 

@@ -14,6 +14,7 @@
 # =============================================================================
 
 import os
+import math
 import torch
 
 
@@ -63,6 +64,46 @@ MODEL_CONFIG = {
 # CẤU HÌNH HUẤN LUYỆN
 # =============================================================================
 
+BUDGET_CONFIG = {
+    # RunPod L40S budget plan:
+    # GPU: $0.86/h, total budget: $50.
+    # Network Volume 150GB for 3 days: 150 * $0.07/GB/month * 3/30 = ~$1.05.
+    # Reserve $0.75 for billing jitter/setup overhead, leaving ~$48.20 GPU time.
+    "total_budget_usd": float(os.environ.get("SWFT_TOTAL_BUDGET_USD", "50")),
+    "gpu_usd_per_hour": float(os.environ.get("SWFT_GPU_USD_PER_HOUR", "0.86")),
+    "storage_gb": float(os.environ.get("SWFT_STORAGE_GB", "150")),
+    "storage_usd_per_gb_month": float(os.environ.get("SWFT_STORAGE_USD_PER_GB_MONTH", "0.07")),
+    "storage_days": float(os.environ.get("SWFT_STORAGE_DAYS", "3")),
+    "budget_safety_usd": float(os.environ.get("SWFT_BUDGET_SAFETY_USD", "0.75")),
+}
+
+
+def _storage_cost_usd() -> float:
+    return (
+        BUDGET_CONFIG["storage_gb"]
+        * BUDGET_CONFIG["storage_usd_per_gb_month"]
+        * BUDGET_CONFIG["storage_days"]
+        / 30.0
+    )
+
+
+def _default_target_train_hours() -> float:
+    available_gpu_usd = max(
+        0.0,
+        BUDGET_CONFIG["total_budget_usd"]
+        - _storage_cost_usd()
+        - BUDGET_CONFIG["budget_safety_usd"]
+    )
+    gpu_hours = available_gpu_usd / max(BUDGET_CONFIG["gpu_usd_per_hour"], 1e-9)
+    return math.floor(gpu_hours * 10.0) / 10.0
+
+
+DEFAULT_TARGET_TRAIN_HOURS = _default_target_train_hours()
+DEFAULT_STAGE0_TIME_BUDGET_HOURS = min(
+    40.0,
+    math.floor(DEFAULT_TARGET_TRAIN_HOURS * 0.715 * 10.0) / 10.0
+)
+
 TRAIN_CONFIG = {
     # --- Optimizer: AdamW ---
     # Loshchilov & Hutter, "Decoupled Weight Decay Regularization", ICLR 2019
@@ -91,11 +132,11 @@ TRAIN_CONFIG = {
     "epochs_stage2": 4,            # Stage 2: Similarity fine-tune
 
     # --- Training Budget ---
-    # Default theo phương án L40S ~$0.86/h với ngân sách GPU khoảng $47:
-    # ~54 giờ tổng, Stage 0 KD ~38 giờ, phần còn lại cho Stage 1/2 và dự phòng.
+    # Default theo phương án L40S $0.86/h, tổng $50, có tính 150GB storage/3 ngày:
+    # ~56 giờ tổng, Stage 0 KD ~40 giờ, phần còn lại cho Stage 1/2 và dự phòng.
     # Có thể override bằng env khi chuyển GPU hoặc cần siết chi phí.
-    "target_train_hours": float(os.environ.get("SWFT_TARGET_TRAIN_HOURS", "54")),
-    "stage0_time_budget_hours": float(os.environ.get("SWFT_STAGE0_TIME_BUDGET_HOURS", "38")),
+    "target_train_hours": float(os.environ.get("SWFT_TARGET_TRAIN_HOURS", str(DEFAULT_TARGET_TRAIN_HOURS))),
+    "stage0_time_budget_hours": float(os.environ.get("SWFT_STAGE0_TIME_BUDGET_HOURS", str(DEFAULT_STAGE0_TIME_BUDGET_HOURS))),
     "stage0_max_samples": int(os.environ.get("SWFT_STAGE0_MAX_SAMPLES", "0")),
     "stage0_sample_offset": int(os.environ.get("SWFT_STAGE0_SAMPLE_OFFSET", "0")),
     # Dùng giá trị nhanh/bảo thủ để cosine schedule không rơi về LR=0 quá sớm
