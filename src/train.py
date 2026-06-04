@@ -52,6 +52,31 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def configure_file_logging(checkpoint_dir: str) -> str:
+    """Mirror console logs to a persistent text file next to checkpoints."""
+    log_path = os.environ.get(
+        "SWFT_TEXT_LOG",
+        os.path.join(checkpoint_dir, "train_console.log")
+    )
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+
+    root_logger = logging.getLogger()
+    abs_log_path = os.path.abspath(log_path)
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            try:
+                if os.path.abspath(handler.baseFilename) == abs_log_path:
+                    return log_path
+            except AttributeError:
+                continue
+
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    root_logger.addHandler(file_handler)
+    return log_path
+
+
 # =============================================================================
 # COSINE ANNEALING WITH WARMUP
 # =============================================================================
@@ -874,6 +899,10 @@ def train_stage1_nli(model, device, debug=True):
 
     total_batch_steps = len(train_loader) * epochs
     log_every = get_progress_log_every_steps()
+    checkpoint_interval_seconds = max(
+        60.0,
+        float(TRAIN_CONFIG.get("checkpoint_every_minutes", 30)) * 60.0
+    )
 
     logger.info(f"Epochs: {epochs}, Batch steps: {total_batch_steps}, "
                 f"Optimizer steps: {total_steps}, Warmup: {warmup_steps}")
@@ -899,6 +928,7 @@ def train_stage1_nli(model, device, debug=True):
     model.train()
     global_step = start_step
     stage_start_time = time.time()
+    last_checkpoint_time = stage_start_time
 
     for epoch in range(start_epoch, epochs):
         epoch_loss = 0.0
@@ -946,6 +976,15 @@ def train_stage1_nli(model, device, debug=True):
                     total_batch_steps, epoch_loss, num_batches,
                     stage_start_time, scheduler.get_lr()
                 )
+
+            now = time.time()
+            if now - last_checkpoint_time >= checkpoint_interval_seconds:
+                avg_loss_so_far = epoch_loss / max(num_batches, 1)
+                save_checkpoint(model, optimizer, scheduler, epoch, global_step,
+                                avg_loss_so_far, checkpoint_path,
+                                extra_modules={'criterion': criterion},
+                                stage_name="Stage1")
+                last_checkpoint_time = now
 
         # Evaluate after each epoch
         spearman = evaluate_stsb(model, eval_loader, device)
@@ -1072,6 +1111,10 @@ def train_stage2_similarity(model, device, debug=True, include_hard_negatives=Fa
 
     total_batch_steps = len(train_loader) * epochs
     log_every = get_progress_log_every_steps()
+    checkpoint_interval_seconds = max(
+        60.0,
+        float(TRAIN_CONFIG.get("checkpoint_every_minutes", 30)) * 60.0
+    )
 
     logger.info(f"Epochs: {epochs}, Batch steps: {total_batch_steps}, "
                 f"Optimizer steps: {total_steps}, Warmup: {warmup_steps}")
@@ -1104,6 +1147,7 @@ def train_stage2_similarity(model, device, debug=True, include_hard_negatives=Fa
     model.train()
     global_step = start_step
     stage_start_time = time.time()
+    last_checkpoint_time = stage_start_time
 
     for epoch in range(start_epoch, epochs):
         epoch_loss = 0.0
@@ -1153,6 +1197,15 @@ def train_stage2_similarity(model, device, debug=True, include_hard_negatives=Fa
                     stage_start_time, scheduler.get_lr()
                 )
 
+            now = time.time()
+            if now - last_checkpoint_time >= checkpoint_interval_seconds:
+                avg_loss_so_far = epoch_loss / max(num_batches, 1)
+                save_checkpoint(model, optimizer, scheduler, epoch, global_step,
+                                avg_loss_so_far, checkpoint_path,
+                                extra_modules=extra_modules,
+                                stage_name=stage_name)
+                last_checkpoint_time = now
+
         spearman = evaluate_stsb(model, eval_loader, device)
         avg_loss = epoch_loss / max(num_batches, 1)
         logger.info(f"[{stage_name}] Epoch {epoch+1}/{epochs} DONE | "
@@ -1198,6 +1251,7 @@ def main():
     device = get_device()
     debug = DEBUG_CONFIG["enabled"]
     metrics_log_path = str(TRAIN_CONFIG["metrics_log_path"])
+    text_log_path = configure_file_logging(str(TRAIN_CONFIG["checkpoint_dir"]))
     init_training_logger(metrics_log_path)
 
     logger.info("=" * 60)
@@ -1205,6 +1259,7 @@ def main():
     logger.info("Train from scratch — Pure PyTorch")
     logger.info(f"Device: {device} | Debug: {debug}")
     logger.info(f"Metrics JSONL: {metrics_log_path}")
+    logger.info(f"Text log: {text_log_path}")
     logger.info("=" * 60)
 
     # Tạo model
@@ -1217,6 +1272,7 @@ def main():
         debug=debug,
         total_params=total_params,
         metrics_log_path=metrics_log_path,
+        text_log_path=text_log_path,
         checkpoint_dir=TRAIN_CONFIG["checkpoint_dir"],
         data_cache_dir=TRAIN_CONFIG["data_cache_dir"],
         target_train_hours=TRAIN_CONFIG["target_train_hours"],

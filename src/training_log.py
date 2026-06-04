@@ -1,10 +1,14 @@
 import json
+import logging
 import os
 import socket
 import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 def _json_safe(value: Any) -> Any:
@@ -30,6 +34,10 @@ class TrainingJsonLogger:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.Lock()
+        self._last_error_log_time = 0.0
+        self.fsync = os.environ.get("SWFT_METRICS_FSYNC", "1").lower() not in {
+            "0", "false", "no"
+        }
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
     def log(self, event: str, **payload: Any) -> None:
@@ -42,8 +50,17 @@ class TrainingJsonLogger:
         record.update({key: _json_safe(value) for key, value in payload.items()})
 
         with self._lock:
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            try:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+                    f.flush()
+                    if self.fsync:
+                        os.fsync(f.fileno())
+            except OSError:
+                now = time.time()
+                if now - self._last_error_log_time > 60:
+                    logger.exception("Không ghi được metrics JSONL: %s", self.path)
+                    self._last_error_log_time = now
 
 
 _LOGGER: Optional[TrainingJsonLogger] = None
