@@ -7,3 +7,9 @@ checkpoints/
 *.pt
 *.pth
 *.bin
+retrieval_system/books/
+retrieval_system/*_index/
+retrieval_system/*.pdf
+retrieval_system/*.epub
+retrieval_system/papers/**/*.pdf
+BT.zip

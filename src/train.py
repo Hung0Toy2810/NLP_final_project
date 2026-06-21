@@ -1,1488 +1,308 @@
-# =============================================================================
-# train.py — Vòng lặp huấn luyện PyTorch thuần (Custom Training Loop)
-# =============================================================================
-# KHÔNG dùng model.fit(), KHÔNG dùng HuggingFace Trainer.
-# Mọi bước đều minh bạch: zero_grad → forward → loss → backward → step.
-#
-# Curriculum Learning Pipeline (Bengio et al., ICML 2009):
-#   Stage 0: Supervised teacher-student distillation trên Wikipedia
-#   Stage 1: NLI SoftmaxLoss (Reimers & Gurevych, EMNLP 2019)
-#   Stage 2: Contrastive softmax + Hard Negatives trên PAWS (Zhang et al., NAACL 2019)
-#
-# Bài báo tham khảo:
-#   [1] Reimers & Gurevych, EMNLP 2019 — Sentence-BERT
-#   [2] Bengio et al., ICML 2009 — Curriculum Learning: dễ → khó
-#   [3] Loshchilov & Hutter, ICLR 2017 — Cosine Annealing LR Schedule
-#   [4] Loshchilov & Hutter, ICLR 2019 — AdamW Optimizer
-#   [5] Vaswani et al., NeurIPS 2017 — Linear Warmup
-#   [6] Gao et al., EMNLP 2021 — SimCSE: Dropout as Data Augmentation
-#   [7] Reimers & Gurevych, EMNLP 2020 — Sentence Embedding Distillation
-# =============================================================================
 
-import os
-import sys
+
 import logging
 import math
+import os
+import sys
 import time
-import shutil
-import gc
-import torch
-import torch.nn as nn
-from typing import Optional
-from torch.optim import AdamW
-from torch.amp import GradScaler, autocast  # pyright: ignore[reportPrivateImportUsage]
+from typing import Any, cast
 
-# Thêm src vào path
+import torch
+import torch.nn.functional as F
+from torch.amp import GradScaler, autocast  # pyright: ignore[reportPrivateImportUsage]
+from torch.optim import AdamW
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import MODEL_CONFIG, TRAIN_CONFIG, DEBUG_CONFIG, DATA_CONFIG, BUDGET_CONFIG, get_device
-from model.sbert import create_swft_model
-from losses import (
-    SoftmaxLoss, MultipleNegativesRankingLoss, Stage0TeacherDistillationLoss
-)
+from config import DATA_CONFIG, MODEL_CONFIG, TRAIN_CONFIG, get_device
 from dataset import (
-    get_tokenizer, WikipediaDistillationDataset, NLIDataset, SimilarityDataset,
-    STSBDataset, RandomIndexSplitDataset, create_dataloader
+    RandomIndexSplitDataset,
+    STSBDataset,
+    WikipediaDistillationDataset,
+    create_dataloader,
+    get_tokenizer,
 )
-from training_log import init_training_logger, log_event
+from losses import Stage0TeacherDistillationLoss
+from model.encoder import create_sftbe_model
 
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def configure_file_logging(checkpoint_dir: str) -> str:
-    """Mirror console logs to a persistent text file next to checkpoints."""
-    log_path = os.environ.get(
-        "SWFT_TEXT_LOG",
-        os.path.join(checkpoint_dir, "train_console.log")
-    )
-    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-
-    root_logger = logging.getLogger()
-    abs_log_path = os.path.abspath(log_path)
-    for handler in root_logger.handlers:
-        if isinstance(handler, logging.FileHandler):
-            try:
-                if os.path.abspath(handler.baseFilename) == abs_log_path:
-                    return log_path
-            except AttributeError:
-                continue
-
-    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    root_logger.addHandler(file_handler)
-    return log_path
-
-
-# =============================================================================
-# COSINE ANNEALING WITH WARMUP
-# =============================================================================
-# Loshchilov & Hutter, "SGDR", ICLR 2017 + Vaswani et al., NeurIPS 2017
-
 class CosineAnnealingWithWarmup:
-    """
-    Learning Rate Schedule: Linear Warmup + Cosine Annealing.
-
-    Phase 1 — Linear Warmup (Vaswani et al., NeurIPS 2017):
-        LR tăng tuyến tính từ 0 đến lr_max trong warmup_steps đầu tiên.
-        Giúp mô hình không bị "sốc" khi gradient lớn ở đầu training.
-
-    Phase 2 — Cosine Annealing (Loshchilov & Hutter, ICLR 2017):
-        LR giảm theo hàm cosine từ lr_max → 0.
-        Giảm mượt hơn linear decay, cho phép model tinh chỉnh cuối training.
-
-    Công thức:
-        if step < warmup_steps:
-            lr = lr_max × (step / warmup_steps)
-        else:
-            progress = (step - warmup_steps) / (total_steps - warmup_steps)
-            lr = lr_max × 0.5 × (1 + cos(π × progress))
-    """
-
     def __init__(self, optimizer, warmup_steps: int, total_steps: int):
         self.optimizer = optimizer
-        self.warmup_steps = warmup_steps
-        self.total_steps = total_steps
-        self.base_lr = optimizer.param_groups[0]['lr']
+        self.warmup_steps = max(1, warmup_steps)
+        self.total_steps = max(1, total_steps)
+        self.base_lr = optimizer.param_groups[0]["lr"]
         self.current_step = 0
 
     def step(self):
         self.current_step += 1
-
         if self.current_step <= self.warmup_steps:
-            # Linear Warmup
-            lr = self.base_lr * (self.current_step / max(1, self.warmup_steps))
+            lr = self.base_lr * self.current_step / self.warmup_steps
         else:
-            # Cosine Annealing
-            progress = (self.current_step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+            progress = (self.current_step - self.warmup_steps) / max(
+                1, self.total_steps - self.warmup_steps
+            )
             progress = min(1.0, max(0.0, progress))
             lr = self.base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
-
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
 
     def get_lr(self):
-        return self.optimizer.param_groups[0]['lr']
+        return self.optimizer.param_groups[0]["lr"]
 
 
-# =============================================================================
-# CHECKPOINT: SAVE & LOAD (Resume Training)
-# =============================================================================
-
-def save_checkpoint(model, optimizer, scheduler, epoch, step, loss, path,
-                    extra_modules: Optional[dict] = None,
-                    stage_name: Optional[str] = None):
-    """
-    Lưu checkpoint để resume training.
-    BẮT BUỘC khi train trên cloud (session có thể bị ngắt bất cứ lúc nào).
-    """
+def save_checkpoint(model, optimizer, scheduler, epoch, step, loss, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    checkpoint = {
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_step': scheduler.current_step,
-        'epoch': epoch,
-        'step': step,
-        'loss': loss,
-    }
-    if extra_modules:
-        checkpoint['extra_module_state_dicts'] = {
-            name: module.state_dict()
-            for name, module in extra_modules.items()
-        }
-    torch.save(checkpoint, path)
-    logger.info(f" Checkpoint saved: {path} (epoch={epoch}, step={step}, loss={loss:.4f})")
-    log_event(
-        "checkpoint",
-        stage=stage_name,
-        epoch=epoch,
-        global_step=step,
-        loss=float(loss),
-        path=path,
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_step": scheduler.current_step,
+            "epoch": epoch,
+            "step": step,
+            "loss": loss,
+        },
+        path,
     )
+    logger.info("Saved checkpoint: %s", path)
 
 
-def load_checkpoint(model, optimizer, scheduler, path, device,
-                    extra_modules: Optional[dict] = None):
-    """
-    Load checkpoint để resume training.
-    Returns: (epoch, step) nếu tìm thấy checkpoint, (0, 0) nếu không.
-    """
+def load_checkpoint(model, optimizer, scheduler, path, device):
     if not os.path.exists(path):
-        logger.info("Không tìm thấy checkpoint. Bắt đầu training từ đầu.")
         return 0, 0
-
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-
-    checkpoint_param_groups = checkpoint.get('optimizer_state_dict', {}).get('param_groups', [])
-    optimizer_param_groups = optimizer.state_dict().get('param_groups', [])
-    compatible_optimizer = len(checkpoint_param_groups) == len(optimizer_param_groups)
-    if compatible_optimizer:
-        for saved_group, current_group in zip(checkpoint_param_groups, optimizer_param_groups):
-            if len(saved_group.get('params', [])) != len(current_group.get('params', [])):
-                compatible_optimizer = False
-                break
-    if not compatible_optimizer:
-        logger.warning(
-            "Checkpoint không tương thích optimizer, bỏ qua để tránh resume sai: %s",
-            path
-        )
-        return 0, 0
-
-    if extra_modules:
-        extra_state = checkpoint.get('extra_module_state_dicts', {})
-        for name, module in extra_modules.items():
-            if name in extra_state:
-                continue
-            else:
-                logger.warning(
-                    "Checkpoint thiếu state cho module phụ '%s', bỏ qua checkpoint: %s",
-                    name,
-                    path,
-                )
-                return 0, 0
-
-    try:
-        model.load_state_dict(checkpoint['model_state_dict'])
-        if extra_modules:
-            extra_state = checkpoint.get('extra_module_state_dicts', {})
-            for name, module in extra_modules.items():
-                module.load_state_dict(extra_state[name])
-    except (KeyError, RuntimeError, ValueError) as exc:
-        logger.warning("Checkpoint không tương thích model/module, bỏ qua %s: %s", path, exc)
-        return 0, 0
-
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    scheduler.current_step = checkpoint['scheduler_step']
-
-    epoch = checkpoint['epoch']
-    step = checkpoint['step']
-    loss = checkpoint['loss']
-    logger.info(f" Checkpoint loaded: {path} (epoch={epoch}, step={step}, loss={loss:.4f})")
-
-    return epoch, step
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.current_step = checkpoint["scheduler_step"]
+    logger.info("Loaded checkpoint: %s", path)
+    return int(checkpoint["epoch"]), int(checkpoint["step"])
 
 
-def load_previous_stage_if_needed(model, current_checkpoint_path: str,
-                                  previous_model_path: str, device,
-                                  current_stage: str, previous_stage: str):
-    """
-    Khi chạy từng stage riêng trên cloud, stage hiện tại nên bắt đầu từ stage trước
-    nếu chưa có checkpoint riêng của stage hiện tại.
-    """
-    if os.path.exists(current_checkpoint_path) or not os.path.exists(previous_model_path):
-        return
-
-    model.load_state_dict(torch.load(previous_model_path, map_location=device, weights_only=True))
-    logger.info(f"{current_stage}: loaded weights from {previous_stage}: {previous_model_path}")
-
-
-def get_gradient_accumulation_steps() -> int:
-    """Số mini-batches tích lũy trước mỗi optimizer step."""
-    return max(1, int(TRAIN_CONFIG.get("gradient_accumulation_steps", 1)))
-
-
-def get_update_steps_per_epoch(num_batches: int, accumulation_steps: int) -> int:
-    """Số optimizer updates mỗi epoch sau khi gradient accumulation."""
-    return math.ceil(num_batches / accumulation_steps)
-
-
-def get_accumulation_divisor(batch_idx: int, num_batches: int,
-                             accumulation_steps: int) -> int:
-    """
-    Chia loss theo số batch thực sự trong accumulation block.
-    Block cuối có thể ngắn hơn accumulation_steps.
-    """
+def accumulation_divisor(batch_idx: int, num_batches: int, accumulation_steps: int) -> int:
     block_start = (batch_idx // accumulation_steps) * accumulation_steps
-    block_end = min(block_start + accumulation_steps, num_batches)
-    return block_end - block_start
+    return min(block_start + accumulation_steps, num_batches) - block_start
 
 
-def should_step_optimizer(batch_idx: int, num_batches: int,
-                          accumulation_steps: int) -> bool:
-    """True khi đã đủ accumulation block hoặc gặp batch cuối epoch."""
-    return ((batch_idx + 1) % accumulation_steps == 0) or (batch_idx + 1 == num_batches)
+def should_step(batch_idx: int, num_batches: int, accumulation_steps: int) -> bool:
+    return (batch_idx + 1) % accumulation_steps == 0 or batch_idx + 1 == num_batches
 
 
-def format_duration(seconds: float) -> str:
-    """Format ngắn gọn cho ETA/logging."""
-    seconds = max(0, int(seconds))
-    hours, rem = divmod(seconds, 3600)
-    minutes, seconds = divmod(rem, 60)
-    if hours:
-        return f"{hours}h{minutes:02d}m"
-    if minutes:
-        return f"{minutes}m{seconds:02d}s"
-    return f"{seconds}s"
-
-
-def get_disk_usage(path: Optional[str]) -> dict:
-    """Return disk usage for the filesystem containing path."""
-    target = path or "."
-    if not os.path.exists(target):
-        target = os.path.dirname(target) or "."
-    try:
-        usage = shutil.disk_usage(target)
-        return {
-            "disk_total_gb": usage.total / 1e9,
-            "disk_used_gb": usage.used / 1e9,
-            "disk_free_gb": usage.free / 1e9,
-            "disk_used_pct": usage.used / max(usage.total, 1) * 100.0,
-        }
-    except OSError:
-        return {}
-
-
-def cleanup_after_stage(device, stage_name: str):
-    """Release Python/CUDA caches before the next stage loads another dataset."""
-    collected = gc.collect()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    logger.info("[Memory] Cleanup after %s | gc_collected=%s", stage_name, collected)
-
-
-def get_progress_log_every_steps() -> int:
-    """Tần suất log progress theo batch steps."""
-    return max(1, int(TRAIN_CONFIG.get("progress_log_every_steps", 500)))
-
-
-def get_stage0_time_budget_seconds(debug: bool):
-    """Wall-clock budget cho Stage 0; tắt trong debug."""
-    if debug:
-        return None
-    hours = float(TRAIN_CONFIG.get("stage0_time_budget_hours", 0))
-    if hours <= 0:
-        return None
-    return hours * 3600.0
-
-
-def get_total_train_budget_seconds(debug: bool):
-    """Wall-clock budget cho toàn pipeline; tắt trong debug."""
-    if debug:
-        return None
-    hours = float(TRAIN_CONFIG.get("target_train_hours", 0))
-    if hours <= 0:
-        return None
-    return hours * 3600.0
-
-
-def global_training_budget_reached(training_deadline: Optional[float]) -> bool:
-    return training_deadline is not None and time.time() >= training_deadline
-
-
-def get_global_budget_left_seconds(training_deadline: Optional[float]) -> Optional[float]:
-    if training_deadline is None:
-        return None
-    return max(0.0, training_deadline - time.time())
-
-
-def log_training_budget_stop(stage_name: str, global_step: int,
-                             training_deadline: Optional[float]) -> None:
-    budget_left = get_global_budget_left_seconds(training_deadline)
-    logger.info(
-        "[%s] Global training budget reached at step %s. Stopping pipeline.",
-        stage_name,
-        global_step,
-    )
-    log_event(
-        "training_budget_stop",
-        stage=stage_name,
-        global_step=global_step,
-        global_budget_left_sec=budget_left,
-        checkpoint_dir=TRAIN_CONFIG["checkpoint_dir"],
-        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
-    )
-
-
-def log_pipeline_stopped_by_budget(stage_name: str, pipeline_start_time: float,
-                                   total_budget_seconds: Optional[float]) -> None:
-    elapsed = time.time() - pipeline_start_time
-    logger.info(
-        "Pipeline stopped by global budget after %s at %s.",
-        format_duration(elapsed),
-        stage_name,
-    )
-    log_event(
-        "training_stopped_budget",
-        stage=stage_name,
-        elapsed_sec=elapsed,
-        total_budget_sec=total_budget_seconds,
-        checkpoint_dir=TRAIN_CONFIG["checkpoint_dir"],
-        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
-    )
-
-
-def estimate_storage_cost_usd() -> float:
-    return (
-        float(BUDGET_CONFIG["storage_gb"])
-        * float(BUDGET_CONFIG["storage_usd_per_gb_month"])
-        * float(BUDGET_CONFIG["storage_days"])
-        / 30.0
-    )
-
-
-def estimate_hourly_runtime_cost_usd() -> float:
-    return (
-        float(BUDGET_CONFIG["gpu_usd_per_hour"])
-        + float(BUDGET_CONFIG["container_disk_usd_per_hour"])
-    )
-
-
-def get_stage0_scheduler_steps(num_batches: int, accumulation_steps: int,
-                               time_budget_seconds) -> int:
-    """
-    Scheduler cần total_steps hữu hạn dù Stage 0 dừng theo timer.
-    Dùng expected seconds/batch bảo thủ; nếu chạy nhanh hơn, cosine được clamp ở 0.
-    """
-    full_update_steps = get_update_steps_per_epoch(num_batches, accumulation_steps)
-    if not time_budget_seconds:
-        return full_update_steps
-
-    expected_seconds = max(
-        1e-6,
-        float(TRAIN_CONFIG.get("stage0_scheduler_expected_seconds_per_batch", 0.12))
-    )
-    expected_batch_steps = max(1, int(time_budget_seconds / expected_seconds))
-    expected_update_steps = get_update_steps_per_epoch(expected_batch_steps, accumulation_steps)
-    return max(1, min(full_update_steps, expected_update_steps))
-
-
-def load_stage0_teacher(device):
-    """
-    Load SentenceTransformer teacher cho Stage 0 distillation.
-
-    Teacher không được train; nó chỉ sinh sentence embeddings làm mục tiêu mềm
-    cho student, theo Reimers & Gurevych, EMNLP 2020.
-    """
-    teacher_name = str(TRAIN_CONFIG.get("stage0_teacher_model"))
+def load_teacher(device):
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError as exc:
-        raise RuntimeError(
-            "Stage 0 distillation cần package sentence-transformers. "
-            "Cài bằng: pip install sentence-transformers."
-        ) from exc
+        raise RuntimeError("Cần cài sentence-transformers để train Stage 0.") from exc
 
-    logger.info(f"[Stage0-KD] Loading teacher: {teacher_name}")
-    teacher = SentenceTransformer(teacher_name, device=str(device))
+    teacher = SentenceTransformer(TRAIN_CONFIG["teacher_model"], device=str(device))
     teacher.eval()
     for parameter in teacher.parameters():
         parameter.requires_grad_(False)
 
-    try:
-        teacher_dim = teacher.get_sentence_embedding_dimension()
-    except Exception:
-        teacher_dim = None
-    expected_dim = int(MODEL_CONFIG["hidden_size"])
-    if teacher_dim is not None and teacher_dim != expected_dim:
+    teacher_dim = teacher.get_sentence_embedding_dimension()
+    if teacher_dim != MODEL_CONFIG["hidden_size"]:
         raise ValueError(
-            f"Stage 0 direct distillation yêu cầu teacher_dim == student_dim "
-            f"({teacher_dim} != {expected_dim}). "
-            "Hãy dùng teacher 768d, ví dụ sentence-transformers/all-mpnet-base-v2."
+            f"Teacher dim phải bằng student dim: {teacher_dim} != {MODEL_CONFIG['hidden_size']}"
         )
-    logger.info(f"[Stage0-KD] Teacher ready | dim={teacher_dim} | device={device}")
     return teacher
 
 
-def encode_stage0_teacher_embeddings(teacher, tokenizer, input_ids, device):
-    """
-    Sinh teacher embeddings cho batch hiện tại.
-
-    Dùng batch_decode từ token ids đã có để không phải giữ raw text trong cache
-    và không làm phình network volume.
-    """
+def teacher_encode(teacher, tokenizer, input_ids, device):
     texts = tokenizer.batch_decode(
         input_ids.detach().cpu().tolist(),
         skip_special_tokens=True,
         clean_up_tokenization_spaces=True,
     )
-    teacher_batch_size = max(
-        1,
-        int(TRAIN_CONFIG.get("stage0_teacher_batch_size", len(texts)))
-    )
     with torch.no_grad():
-        teacher_embeddings = teacher.encode(
+        embeddings = teacher.encode(
             texts,
-            batch_size=teacher_batch_size,
+            batch_size=TRAIN_CONFIG["teacher_batch_size"],
             convert_to_tensor=True,
             normalize_embeddings=True,
             show_progress_bar=False,
         )
-    return teacher_embeddings.to(device=device, dtype=torch.float32)
+    return embeddings.to(device=device, dtype=torch.float32)
 
 
-def log_progress(stage_name: str, epoch: int, epochs: int, global_step: int,
-                 total_batch_steps: int, epoch_loss: float, num_batches: int,
-                 stage_start_time: float, lr: float,
-                 time_budget_seconds: Optional[float] = None):
-    """Log throughput và ETA để kiểm soát budget cloud."""
-    elapsed = max(time.time() - stage_start_time, 1e-9)
-    batches_per_sec = num_batches / elapsed
-    remaining_batches = max(0, total_batch_steps - global_step)
-    dataset_eta = remaining_batches / max(batches_per_sec, 1e-9)
-    budget_left = None
-    eta = dataset_eta
-    if time_budget_seconds is not None and time_budget_seconds > 0:
-        budget_left = max(0.0, time_budget_seconds - elapsed)
-        eta = min(dataset_eta, budget_left)
-    avg_loss = epoch_loss / max(num_batches, 1)
-    msg = (
-        f"[{stage_name}] Epoch {epoch}/{epochs} | Step {global_step}/{total_batch_steps} | "
-        f"Loss: {avg_loss:.4f} | LR: {lr:.2e} | "
-        f"{batches_per_sec:.2f} batch/s | Elapsed: {format_duration(elapsed)} | "
-        f"ETA: {format_duration(eta)}"
-    )
-    if budget_left is not None:
-        msg += f" | Budget left: {format_duration(budget_left)}"
-    logger.info(msg)
-    log_event(
-        "progress",
-        stage=stage_name,
-        epoch=epoch,
-        epochs=epochs,
-        global_step=global_step,
-        total_batch_steps=total_batch_steps,
-        avg_loss=avg_loss,
-        lr=lr,
-        batches_per_sec=batches_per_sec,
-        elapsed_sec=elapsed,
-        eta_sec=eta,
-        budget_left_sec=budget_left,
-    )
-
-
-# =============================================================================
-# EVALUATION FUNCTION
-# =============================================================================
-
-def evaluate_stsb(model, eval_dataloader, device):
-    """
-    Đánh giá trên STS-B bằng Spearman Correlation.
-    Cer et al., SemEval@ACL 2017.
-    """
+def evaluate_stsb(model, loader, device):
     from scipy.stats import spearmanr
 
     model.eval()
-    all_scores = []
-    all_labels = []
-
+    predictions, labels = [], []
     with torch.no_grad():
-        for batch in eval_dataloader:
-            ids_a = batch['input_ids_a'].to(device)
-            mask_a = batch['attention_mask_a'].to(device)
-            ids_b = batch['input_ids_b'].to(device)
-            mask_b = batch['attention_mask_b'].to(device)
-
+        for batch in loader:
+            ids_a = batch["input_ids_a"].to(device)
+            mask_a = batch["attention_mask_a"].to(device)
+            ids_b = batch["input_ids_b"].to(device)
+            mask_b = batch["attention_mask_b"].to(device)
             emb_a = model(ids_a, mask_a)
             emb_b = model(ids_b, mask_b)
-
-            # Cosine similarity
-            cos_sim = nn.functional.cosine_similarity(emb_a, emb_b, dim=-1)
-            all_scores.extend(cos_sim.cpu().tolist())
-            all_labels.extend(batch['score'].tolist())
-
-    spearman_corr, _ = spearmanr(all_scores, all_labels)
+            cosine = F.cosine_similarity(emb_a, emb_b, dim=-1)
+            predictions.extend(cosine.cpu().tolist())
+            labels.extend(batch["score"].tolist())
     model.train()
-    return spearman_corr
+    correlation = spearmanr(predictions, labels)[0]
+    return float(cast(Any, correlation))
 
 
-def evaluate_stage0_distillation(model, teacher_model, tokenizer, eval_dataloader,
-                                 device, criterion, use_amp: bool):
-    """
-    Held-out Stage 0 validation: đo student mimic teacher trên Wikipedia split
-    không tham gia training.
-    """
+def evaluate_distillation(model, teacher, tokenizer, loader, criterion, device, use_amp):
     model.eval()
-    total_loss = 0.0
-    num_batches = 0
-    num_samples = 0
-
+    total_loss, total_samples = 0.0, 0
     with torch.no_grad():
-        for batch in eval_dataloader:
-            ids = batch['input_ids'].to(device)
-            mask = batch['attention_mask'].to(device)
-            teacher_embeddings = encode_stage0_teacher_embeddings(
-                teacher_model, tokenizer, ids, device
-            )
-
+        for batch in loader:
+            ids = batch["input_ids"].to(device)
+            mask = batch["attention_mask"].to(device)
+            targets = teacher_encode(teacher, tokenizer, ids, device)
             with autocast(device_type=device.type, enabled=use_amp):
-                student_embeddings = model(ids, mask)
-                loss = criterion(student_embeddings, teacher_embeddings)
-
-            batch_size = ids.size(0)
-            total_loss += loss.item() * batch_size
-            num_batches += 1
-            num_samples += batch_size
-
-    avg_loss = total_loss / max(num_samples, 1)
-    avg_cosine = 1.0 - avg_loss
+                loss = criterion(model(ids, mask), targets)
+            total_loss += loss.item() * ids.size(0)
+            total_samples += ids.size(0)
     model.train()
-    return avg_loss, avg_cosine, num_batches, num_samples
+    avg_loss = total_loss / max(1, total_samples)
+    return avg_loss, 1.0 - avg_loss
 
 
-def _create_eval_loader(device, debug, cache_dir):
-    """Helper: tạo eval dataloader cho STS-B."""
+def main():
+    device = get_device()
     tokenizer = get_tokenizer(DATA_CONFIG["tokenizer_name"])
-    batch_size = TRAIN_CONFIG["batch_size_debug"] if debug else TRAIN_CONFIG["batch_size_train"]
-    num_workers = 0 if device.type != "cuda" else 4
+    os.makedirs(TRAIN_CONFIG["checkpoint_dir"], exist_ok=True)
 
-    stsb_dataset = STSBDataset(
-        cache_dir=cache_dir,
-        tokenizer=tokenizer,
-        max_length=MODEL_CONFIG["max_seq_length"],
-        split="validation",
-        debug=debug,
-        num_debug_samples=DEBUG_CONFIG["eval_samples"]
+    model = create_sftbe_model(MODEL_CONFIG).to(device)
+    teacher = load_teacher(device)
+    criterion = Stage0TeacherDistillationLoss()
+
+    full_dataset = WikipediaDistillationDataset(TRAIN_CONFIG["data_cache_dir"])
+    train_dataset = RandomIndexSplitDataset(
+        full_dataset,
+        "train",
+        validation_ratio=TRAIN_CONFIG["validation_ratio"],
+        seed=TRAIN_CONFIG["split_seed"],
     )
-    return create_dataloader(stsb_dataset, batch_size=batch_size,
-                             shuffle=False, num_workers=num_workers,
-                             prefetch_factor=2 if num_workers > 0 else None,
-                             drop_last=False)
-
-
-# =============================================================================
-# GIAI ĐOẠN 0: SUPERVISED TEACHER DISTILLATION
-# =============================================================================
-# Reimers & Gurevych, EMNLP 2020:
-#   Student sentence encoder học mimic embedding space của teacher.
-#
-# Trong pipeline này:
-#   1. Teacher all-mpnet-base-v2 sinh normalized 768d sentence embedding.
-#   2. Student SWFT sinh 768d sentence embedding từ cùng input.
-#   3. Loss = 1 - cosine(normalize(student), normalize(teacher)).
-#   4. Teacher chạy eval/no_grad; backward chỉ cập nhật student.
-
-def train_stage0_distillation(model, device, debug=True,
-                              training_deadline: Optional[float] = None) -> bool:
-    """
-    Giai đoạn 0: supervised direct teacher-student distillation.
-    Curriculum Learning Stage 0 (dễ nhất) — Bengio et al., ICML 2009.
-
-    Mục tiêu: Học biểu diễn ngôn ngữ cơ bản từ text thô Wikipedia
-    Supervisor: sentence-transformers/all-mpnet-base-v2
-    Loss: 1 - cosine(normalize(student), normalize(teacher))
-    """
-    logger.info("=" * 60)
-    logger.info("GIAI ĐOẠN 0: SUPERVISED TEACHER DISTILLATION")
-    logger.info("Paper: Reimers & Gurevych, EMNLP 2020")
-    logger.info("Teacher target: normalized 768d sentence embedding; backward chỉ qua student")
-    logger.info("=" * 60)
-
-    cache_dir = TRAIN_CONFIG.get("data_cache_dir")
-    tokenizer = get_tokenizer(DATA_CONFIG["tokenizer_name"])
-    batch_size = TRAIN_CONFIG["batch_size_debug"] if debug else TRAIN_CONFIG["batch_size_train"]
-    num_workers = 0 if device.type != "cuda" else 8  # Wikipedia lớn → cần nhiều workers
-
-    # Dataset
-    stage0_max_samples = TRAIN_CONFIG.get("stage0_max_samples") or None
-    wiki_dataset_full = WikipediaDistillationDataset(
-        cache_dir=cache_dir,
-        tokenizer=tokenizer,
-        max_length=MODEL_CONFIG["max_seq_length"],
-        debug=debug,
-        num_debug_samples=DEBUG_CONFIG["num_samples"],
-        max_samples=stage0_max_samples,
-        sample_offset=TRAIN_CONFIG.get("stage0_sample_offset", 0)
+    val_dataset = RandomIndexSplitDataset(
+        full_dataset,
+        "validation",
+        validation_ratio=TRAIN_CONFIG["validation_ratio"],
+        seed=TRAIN_CONFIG["split_seed"],
     )
-    validation_ratio = float(TRAIN_CONFIG.get("stage0_validation_ratio", 0.02))
-    split_seed = int(TRAIN_CONFIG.get("stage0_split_seed", 42))
-    wiki_train_dataset = RandomIndexSplitDataset(
-        wiki_dataset_full,
-        split="train",
-        validation_ratio=validation_ratio,
-        seed=split_seed,
-    )
-    wiki_validation_dataset = RandomIndexSplitDataset(
-        wiki_dataset_full,
-        split="validation",
-        validation_ratio=validation_ratio,
-        seed=split_seed,
-    )
-    if len(wiki_train_dataset) + len(wiki_validation_dataset) != len(wiki_dataset_full):
-        raise RuntimeError("Stage0 split không bao phủ đúng toàn bộ Wikipedia dataset.")
 
-    train_loader = create_dataloader(wiki_train_dataset, batch_size=batch_size,
-                                     shuffle=True, num_workers=num_workers,
-                                     prefetch_factor=2 if num_workers > 0 else None)
-    stage0_validation_loader = create_dataloader(
-        wiki_validation_dataset, batch_size=batch_size,
-        shuffle=False, num_workers=num_workers,
-        prefetch_factor=2 if num_workers > 0 else None,
+    num_workers = 8 if device.type == "cuda" else 0
+    batch_size = TRAIN_CONFIG["batch_size"]
+    train_loader = create_dataloader(
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
+    )
+    val_loader = create_dataloader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, drop_last=False
+    )
+    stsb_loader = create_dataloader(
+        STSBDataset(
+            TRAIN_CONFIG["data_cache_dir"],
+            tokenizer,
+            split="validation",
+            max_length=MODEL_CONFIG["max_seq_length"],
+        ),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
         drop_last=False,
     )
-    accumulation_steps = get_gradient_accumulation_steps()
 
-    # Evaluation
-    eval_loader = _create_eval_loader(device, debug, cache_dir)
-
-    stage_log_name = "Stage0-distillation"
-
-    # Loss
-    teacher_model = load_stage0_teacher(device)
-    distillation_criterion = Stage0TeacherDistillationLoss()
-    logger.info(
-        "[Stage0-KD] Enabled | objective=distillation | teacher=%s | weight=%.3f",
-        TRAIN_CONFIG["stage0_teacher_model"],
-        TRAIN_CONFIG["stage0_distillation_weight"],
-    )
-
-    # Optimizer — AdamW, Loshchilov & Hutter, ICLR 2019
     optimizer = AdamW(
         model.parameters(),
         lr=TRAIN_CONFIG["learning_rate"],
         betas=(TRAIN_CONFIG["adam_beta1"], TRAIN_CONFIG["adam_beta2"]),
         eps=TRAIN_CONFIG["adam_epsilon"],
-        weight_decay=TRAIN_CONFIG["weight_decay"]
+        weight_decay=TRAIN_CONFIG["weight_decay"],
     )
-
-    # LR Schedule
-    epochs = TRAIN_CONFIG["epochs_stage0"]
-    total_batch_steps = len(train_loader) * epochs
-    time_budget_seconds = get_stage0_time_budget_seconds(debug)
-    total_steps = get_stage0_scheduler_steps(
-        total_batch_steps, accumulation_steps, time_budget_seconds
+    accumulation_steps = max(1, TRAIN_CONFIG["gradient_accumulation_steps"])
+    updates_per_epoch = math.ceil(len(train_loader) / accumulation_steps)
+    total_updates = updates_per_epoch * TRAIN_CONFIG["epochs"]
+    scheduler = CosineAnnealingWithWarmup(
+        optimizer,
+        warmup_steps=int(TRAIN_CONFIG["warmup_ratio"] * total_updates),
+        total_steps=total_updates,
     )
-    warmup_steps = int(TRAIN_CONFIG["warmup_ratio"] * total_steps)
-    scheduler = CosineAnnealingWithWarmup(optimizer, warmup_steps, total_steps)
-
-    # Mixed Precision
     use_amp = TRAIN_CONFIG["use_amp_on_cuda"] and device.type == "cuda"
     scaler = GradScaler(enabled=use_amp)
 
-    # Resume
-    checkpoint_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage0_latest.pt")
-    start_epoch, start_step = load_checkpoint(model, optimizer, scheduler, checkpoint_path, device)
-
-    log_every = get_progress_log_every_steps()
-    checkpoint_interval_seconds = max(
-        60.0,
-        float(TRAIN_CONFIG.get("checkpoint_every_minutes", 30)) * 60.0
-    )
-
-    logger.info(f"Wikipedia sentences: {len(wiki_dataset_full):,}")
-    logger.info(
-        "Stage0 held-out split: train=%s | validation=%s | ratio=%.4f | seed=%s",
-        f"{len(wiki_train_dataset):,}",
-        f"{len(wiki_validation_dataset):,}",
-        validation_ratio,
-        split_seed,
-    )
-    logger.info(f"Epochs: {epochs}, Batch steps: {total_batch_steps}, "
-                f"Scheduler optimizer steps: {total_steps}, Warmup: {warmup_steps}")
-    logger.info(f"Batch size: {batch_size}, Grad accumulation: {accumulation_steps}, "
-                f"Optimizer effective batch: {batch_size * accumulation_steps}, "
-                f"AMP: {use_amp}, Device: {device}")
-    logger.info(f"Direct KD teacher: {TRAIN_CONFIG['stage0_teacher_model']}")
-    logger.info("Stage0 objective: supervised distillation")
-    if not debug:
-        sample_cap_text = f"{stage0_max_samples:,}" if stage0_max_samples else "none"
-        budget_text = format_duration(time_budget_seconds) if time_budget_seconds else "disabled"
-        logger.info(f"Budget target: {TRAIN_CONFIG.get('target_train_hours')}h total train | "
-                    f"Stage0 time budget: {budget_text} | Stage0 sample cap: {sample_cap_text}")
-    log_event(
-        "stage_start",
-        stage=stage_log_name,
-        epochs=epochs,
-        total_batch_steps=total_batch_steps,
-        scheduler_steps=total_steps,
-        warmup_steps=warmup_steps,
-        batch_size=batch_size,
-        gradient_accumulation_steps=accumulation_steps,
-        use_amp=use_amp,
-        device=str(device),
-        debug=debug,
-        time_budget_sec=time_budget_seconds,
-        teacher_model=TRAIN_CONFIG["stage0_teacher_model"],
-        stage0_total_samples=len(wiki_dataset_full),
-        stage0_train_samples=len(wiki_train_dataset),
-        stage0_validation_samples=len(wiki_validation_dataset),
-        stage0_validation_ratio=validation_ratio,
-        stage0_split_seed=split_seed,
-        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
-    )
-
-    # ===== TRAINING LOOP =====
-    model.train()
-    global_step = start_step
-    stage_start_time = time.time()
-    last_checkpoint_time = stage_start_time
-    stop_stage0 = False
-    stop_pipeline_budget = False
-
-    for epoch in range(start_epoch, epochs):
-        epoch_loss = 0.0
-        num_batches = 0
-        optimizer.zero_grad(set_to_none=True)
-
-        for batch_idx, batch in enumerate(train_loader):
-            if global_training_budget_reached(training_deadline):
-                avg_loss = epoch_loss / max(num_batches, 1)
-                save_checkpoint(
-                    model, optimizer, scheduler, epoch, global_step, avg_loss,
-                    checkpoint_path,
-                    stage_name=stage_log_name
-                )
-                log_training_budget_stop(stage_log_name, global_step, training_deadline)
-                stop_pipeline_budget = True
-                break
-
-            elapsed = time.time() - stage_start_time
-            if time_budget_seconds is not None and elapsed >= time_budget_seconds:
-                logger.info(f"[{stage_log_name}] Time budget reached after "
-                            f"{format_duration(elapsed)} at step {global_step}.")
-                stop_stage0 = True
-                break
-
-            if epoch == start_epoch and batch_idx < (start_step % len(train_loader)):
-                continue
-
-            ids = batch['input_ids'].to(device)
-            mask = batch['attention_mask'].to(device)
-            teacher_embeddings = encode_stage0_teacher_embeddings(
-                teacher_model, tokenizer, ids, device
-            )
-
-            with autocast(device_type=device.type, enabled=use_amp):
-                model.train()  # Đảm bảo Dropout BẬT
-                embedding_1 = model(ids, mask)
-                distillation_loss = distillation_criterion(
-                    embedding_1,
-                    teacher_embeddings
-                )
-                loss = TRAIN_CONFIG["stage0_distillation_weight"] * distillation_loss
-
-            raw_loss = loss.detach()
-            loss = loss / get_accumulation_divisor(batch_idx, len(train_loader), accumulation_steps)
-            scaler.scale(loss).backward()
-
-            if should_step_optimizer(batch_idx, len(train_loader), accumulation_steps):
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-
-            epoch_loss += raw_loss.item()
-            num_batches += 1
-            global_step += 1
-
-            if global_step % log_every == 0:
-                log_progress(
-                    stage_log_name, epoch + 1, epochs, global_step,
-                    total_batch_steps, epoch_loss, num_batches,
-                    stage_start_time, scheduler.get_lr(),
-                    time_budget_seconds=time_budget_seconds
-                )
-
-            now = time.time()
-            if now - last_checkpoint_time >= checkpoint_interval_seconds:
-                avg_loss = epoch_loss / max(num_batches, 1)
-                save_checkpoint(
-                    model, optimizer, scheduler, epoch, global_step, avg_loss,
-                    checkpoint_path,
-                    stage_name=stage_log_name
-                )
-                last_checkpoint_time = now
-
-        if stop_pipeline_budget:
-            return False
-
-        # Evaluate held-out Wikipedia distillation split first. This split is
-        # never used by the train DataLoader, so it detects Stage 0 memorization.
-        stage0_val_loss, stage0_val_cosine, stage0_val_batches, stage0_val_samples = (
-            evaluate_stage0_distillation(
-                model,
-                teacher_model,
-                tokenizer,
-                stage0_validation_loader,
-                device,
-                distillation_criterion,
-                use_amp,
-            )
-        )
-
-        logger.info(f"[{stage_log_name}] Held-out Wikipedia | "
-                    f"Loss: {stage0_val_loss:.4f} | "
-                    f"Cosine: {stage0_val_cosine:.4f} | "
-                    f"Samples: {stage0_val_samples:,}")
-
-        # Evaluate downstream STS-B as a separate semantic quality signal.
-        spearman = evaluate_stsb(model, eval_loader, device)
-        avg_loss = epoch_loss / max(num_batches, 1)
-        logger.info(f"[{stage_log_name}] Epoch {epoch+1}/{epochs} DONE | "
-                   f"Avg Loss: {avg_loss:.4f} | "
-                   f"Stage0 Val Loss: {stage0_val_loss:.4f} | "
-                   f"Stage0 Val Cosine: {stage0_val_cosine:.4f} | "
-                   f"STS-B Spearman: {spearman:.4f}")
-        log_event(
-            "epoch_end",
-            stage=stage_log_name,
-            epoch=epoch + 1,
-            epochs=epochs,
-            global_step=global_step,
-            avg_loss=avg_loss,
-            stage0_val_loss=stage0_val_loss,
-            stage0_val_cosine=stage0_val_cosine,
-            stage0_val_batches=stage0_val_batches,
-            stage0_val_samples=stage0_val_samples,
-            stage0_validation_ratio=validation_ratio,
-            stage0_split_seed=split_seed,
-            stsb_spearman=spearman,
-            lr=scheduler.get_lr(),
-            elapsed_sec=time.time() - stage_start_time,
-            **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
-        )
-
-        save_checkpoint(model, optimizer, scheduler, epoch + 1, global_step, avg_loss,
-                       checkpoint_path, stage_name=stage_log_name)
-
-        if stop_stage0:
-            break
-
+    latest_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage0_latest.pt")
     final_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage0_final.pt")
-    torch.save(model.state_dict(), final_path)
-    logger.info(f" Giai đoạn 0 hoàn thành. Model saved: {final_path}")
-    log_event(
-        "stage_end",
-        stage=stage_log_name,
-        final_model_path=final_path,
-        global_step=global_step,
-        elapsed_sec=time.time() - stage_start_time,
-        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
-    )
-    return True
+    start_epoch, global_step = load_checkpoint(model, optimizer, scheduler, latest_path, device)
 
+    logger.info("SFT-BE params: %.1fM", model.count_parameters() / 1e6)
+    logger.info("Train samples: %s | validation samples: %s", len(train_dataset), len(val_dataset))
+    logger.info("Batch: %s | grad accumulation: %s | AMP: %s", batch_size, accumulation_steps, use_amp)
 
-# =============================================================================
-# GIAI ĐOẠN 1: NLI TRAINING
-# =============================================================================
-
-def train_stage1_nli(model, device, debug=True,
-                     training_deadline: Optional[float] = None) -> bool:
-    """
-    Giai đoạn 1: NLI Fine-tune — Reimers & Gurevych, EMNLP 2019.
-    Curriculum Learning Stage 1 (dễ) — Bengio et al., ICML 2009.
-
-    Mục tiêu: Học phân biệt ngữ nghĩa tổng quát (Entailment vs Contradiction vs Neutral)
-    Loss: SoftmaxLoss — concat(u, v, |u-v|) → Linear → CrossEntropy
-    """
-    logger.info("=" * 60)
-    logger.info("GIAI ĐOẠN 1: NLI TRAINING (Curriculum Learning — Easy)")
-    logger.info("Paper: Reimers & Gurevych, EMNLP 2019 + Bengio et al., ICML 2009")
-    logger.info("=" * 60)
-
-    cache_dir = TRAIN_CONFIG.get("data_cache_dir")
-    tokenizer = get_tokenizer(DATA_CONFIG["tokenizer_name"])
-    batch_size = TRAIN_CONFIG["batch_size_debug"] if debug else TRAIN_CONFIG["batch_size_train"]
-    num_workers = 0 if device.type != "cuda" else 4
-
-    # Dataset
-    nli_dataset = NLIDataset(
-        cache_dir=cache_dir,
-        tokenizer=tokenizer,
-        max_length=MODEL_CONFIG["max_seq_length"],
-        debug=debug,
-        num_debug_samples=DEBUG_CONFIG["num_samples"]
-    )
-    train_loader = create_dataloader(nli_dataset, batch_size=batch_size,
-                                     shuffle=True, num_workers=num_workers,
-                                     prefetch_factor=2 if num_workers > 0 else None)
-    accumulation_steps = get_gradient_accumulation_steps()
-
-    # Evaluation
-    eval_loader = _create_eval_loader(device, debug, cache_dir)
-
-    # Loss — SoftmaxLoss, Reimers & Gurevych, EMNLP 2019
-    criterion = SoftmaxLoss(hidden_size=MODEL_CONFIG["hidden_size"], num_labels=3).to(device)
-
-    # Optimizer — AdamW, Loshchilov & Hutter, ICLR 2019
-    optimizer = AdamW(
-        list(model.parameters()) + list(criterion.parameters()),
-        lr=TRAIN_CONFIG["learning_rate"],
-        betas=(TRAIN_CONFIG["adam_beta1"], TRAIN_CONFIG["adam_beta2"]),
-        eps=TRAIN_CONFIG["adam_epsilon"],
-        weight_decay=TRAIN_CONFIG["weight_decay"]
-    )
-
-    # LR Schedule — Cosine Annealing with Warmup
-    epochs = TRAIN_CONFIG["epochs_stage1"]
-    update_steps_per_epoch = get_update_steps_per_epoch(len(train_loader), accumulation_steps)
-    total_steps = update_steps_per_epoch * epochs
-    warmup_steps = int(TRAIN_CONFIG["warmup_ratio"] * total_steps)
-    scheduler = CosineAnnealingWithWarmup(optimizer, warmup_steps, total_steps)
-
-    # Mixed Precision — FP16 trên CUDA, FP32 trên MPS
-    use_amp = TRAIN_CONFIG["use_amp_on_cuda"] and device.type == "cuda"
-    scaler = GradScaler(enabled=use_amp)
-
-    # Resume from checkpoint
-    checkpoint_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage1_latest.pt")
-    previous_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage0_final.pt")
-    load_previous_stage_if_needed(model, checkpoint_path, previous_path, device,
-                                  "Stage1", "Stage0")
-    start_epoch, start_step = load_checkpoint(
-        model, optimizer, scheduler, checkpoint_path, device,
-        extra_modules={'criterion': criterion}
-    )
-
-    total_batch_steps = len(train_loader) * epochs
-    log_every = get_progress_log_every_steps()
-    checkpoint_interval_seconds = max(
-        60.0,
-        float(TRAIN_CONFIG.get("checkpoint_every_minutes", 30)) * 60.0
-    )
-
-    logger.info(f"Epochs: {epochs}, Batch steps: {total_batch_steps}, "
-                f"Optimizer steps: {total_steps}, Warmup: {warmup_steps}")
-    logger.info(f"Batch size: {batch_size}, Grad accumulation: {accumulation_steps}, "
-                f"Optimizer effective batch: {batch_size * accumulation_steps}, "
-                f"AMP: {use_amp}, Device: {device}")
-    log_event(
-        "stage_start",
-        stage="Stage1",
-        epochs=epochs,
-        total_batch_steps=total_batch_steps,
-        scheduler_steps=total_steps,
-        warmup_steps=warmup_steps,
-        batch_size=batch_size,
-        gradient_accumulation_steps=accumulation_steps,
-        use_amp=use_amp,
-        device=str(device),
-        debug=debug,
-        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
-    )
-
-    # ===== TRAINING LOOP =====
-    model.train()
-    global_step = start_step
-    stage_start_time = time.time()
-    last_checkpoint_time = stage_start_time
-    stop_pipeline_budget = False
-
-    for epoch in range(start_epoch, epochs):
-        epoch_loss = 0.0
-        num_batches = 0
+    start_time = time.time()
+    for epoch in range(start_epoch, TRAIN_CONFIG["epochs"]):
+        model.train()
         optimizer.zero_grad(set_to_none=True)
+        epoch_loss, seen_batches = 0.0, 0
 
         for batch_idx, batch in enumerate(train_loader):
-            if global_training_budget_reached(training_deadline):
-                avg_loss_so_far = epoch_loss / max(num_batches, 1)
-                save_checkpoint(model, optimizer, scheduler, epoch, global_step,
-                                avg_loss_so_far, checkpoint_path,
-                                extra_modules={'criterion': criterion},
-                                stage_name="Stage1")
-                log_training_budget_stop("Stage1", global_step, training_deadline)
-                stop_pipeline_budget = True
-                break
-
-            if epoch == start_epoch and batch_idx < (start_step % len(train_loader)):
-                continue  # Skip batches already processed
-
-            # Chuyển data lên device
-            ids_a = batch['input_ids_a'].to(device)
-            mask_a = batch['attention_mask_a'].to(device)
-            ids_b = batch['input_ids_b'].to(device)
-            mask_b = batch['attention_mask_b'].to(device)
-            labels = batch['label'].to(device)
-
-            # ===== Forward Pass =====
-            with autocast(device_type=device.type, enabled=use_amp):
-                # Encode 2 câu qua Siamese Encoder (chia sẻ trọng số)
-                embedding_a = model(ids_a, mask_a)  # (B, H)
-                embedding_b = model(ids_b, mask_b)  # (B, H)
-
-                # SoftmaxLoss: concat(u, v, |u-v|) → classifier → CE
-                loss = criterion(embedding_a, embedding_b, labels)
-
-            # ===== Backward Pass =====
-            raw_loss = loss.detach()
-            loss = loss / get_accumulation_divisor(batch_idx, len(train_loader), accumulation_steps)
-            scaler.scale(loss).backward()
-
-            if should_step_optimizer(batch_idx, len(train_loader), accumulation_steps):
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-
-            epoch_loss += raw_loss.item()
-            num_batches += 1
-            global_step += 1
-
-            if global_step % log_every == 0:
-                log_progress(
-                    "Stage1", epoch + 1, epochs, global_step,
-                    total_batch_steps, epoch_loss, num_batches,
-                    stage_start_time, scheduler.get_lr()
-                )
-
-            now = time.time()
-            if now - last_checkpoint_time >= checkpoint_interval_seconds:
-                avg_loss_so_far = epoch_loss / max(num_batches, 1)
-                save_checkpoint(model, optimizer, scheduler, epoch, global_step,
-                                avg_loss_so_far, checkpoint_path,
-                                extra_modules={'criterion': criterion},
-                                stage_name="Stage1")
-                last_checkpoint_time = now
-
-        if stop_pipeline_budget:
-            return False
-
-        # Evaluate after each epoch
-        spearman = evaluate_stsb(model, eval_loader, device)
-        avg_loss = epoch_loss / max(num_batches, 1)
-        logger.info(f"[Stage1] Epoch {epoch+1}/{epochs} DONE | "
-                   f"Avg Loss: {avg_loss:.4f} | STS-B Spearman: {spearman:.4f}")
-        log_event(
-            "epoch_end",
-            stage="Stage1",
-            epoch=epoch + 1,
-            epochs=epochs,
-            global_step=global_step,
-            avg_loss=avg_loss,
-            stsb_spearman=spearman,
-            lr=scheduler.get_lr(),
-            elapsed_sec=time.time() - stage_start_time,
-            **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
-        )
-
-        # Save checkpoint
-        save_checkpoint(model, optimizer, scheduler, epoch + 1, global_step, avg_loss,
-                       checkpoint_path, extra_modules={'criterion': criterion},
-                       stage_name="Stage1")
-
-    # Save final model
-    final_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage1_final.pt")
-    torch.save(model.state_dict(), final_path)
-    logger.info(f" Giai đoạn 1 hoàn thành. Model saved: {final_path}")
-    log_event(
-        "stage_end",
-        stage="Stage1",
-        final_model_path=final_path,
-        global_step=global_step,
-        elapsed_sec=time.time() - stage_start_time,
-        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
-    )
-    return True
-
-
-# =============================================================================
-# GIAI ĐOẠN 2: SIMILARITY TRAINING (Contrastive Learning)
-# =============================================================================
-
-def train_stage2_similarity(model, device, debug=True, include_hard_negatives=False,
-                            training_deadline: Optional[float] = None) -> bool:
-    """
-    Giai đoạn 2: Similarity Fine-tune — Reimers & Gurevych, EMNLP 2019.
-    Curriculum Learning Stage 2 (khó hơn) — Bengio et al., ICML 2009.
-
-    Mục tiêu: Tối ưu embedding cho similarity/paraphrase.
-    - Stage2: SimCSE-style contrastive softmax trên positive pairs.
-    - Stage2+HN: SBERT SoftmaxLoss 2 lớp trên cặp PAWS paraphrase/non-paraphrase.
-    """
-    stage_name = "Stage2+HN" if include_hard_negatives else "Stage2"
-    logger.info("=" * 60)
-    logger.info(f"GIAI ĐOẠN 2: SIMILARITY TRAINING ({stage_name})")
-    logger.info("Paper: Gao et al., EMNLP 2021 (contrastive) + Zhang et al., NAACL 2019 (PAWS)")
-    logger.info("=" * 60)
-
-    cache_dir = TRAIN_CONFIG.get("data_cache_dir")
-    tokenizer = get_tokenizer(DATA_CONFIG["tokenizer_name"])
-    batch_size = TRAIN_CONFIG["batch_size_debug"] if debug else TRAIN_CONFIG["batch_size_train"]
-    num_workers = 0 if device.type != "cuda" else 4
-
-    # Dataset
-    sim_dataset = SimilarityDataset(
-        cache_dir=cache_dir,
-        tokenizer=tokenizer,
-        max_length=MODEL_CONFIG["max_seq_length"],
-        debug=debug,
-        num_debug_samples=DEBUG_CONFIG["num_samples"],
-        include_hard_negatives=include_hard_negatives
-    )
-    train_loader = create_dataloader(sim_dataset, batch_size=batch_size,
-                                     shuffle=True, num_workers=num_workers,
-                                     prefetch_factor=2 if num_workers > 0 else None)
-    accumulation_steps = get_gradient_accumulation_steps()
-
-    # Evaluation
-    eval_loader = _create_eval_loader(device, debug, cache_dir)
-
-    # Loss
-    if include_hard_negatives:
-        # PAWS cung cấp pair labels, không phải triplets cùng anchor.
-        # Dùng supervised SBERT-style pair classification trên [u, v, |u-v|].
-        criterion = SoftmaxLoss(hidden_size=MODEL_CONFIG["hidden_size"], num_labels=2).to(device)
-    else:
-        criterion = MultipleNegativesRankingLoss(temperature=TRAIN_CONFIG["temperature"])
-
-    # Optimizer — AdamW
-    optim_params = list(model.parameters())
-    if include_hard_negatives:
-        optim_params += list(criterion.parameters())
-    optimizer = AdamW(
-        optim_params,
-        lr=TRAIN_CONFIG["learning_rate"],
-        betas=(TRAIN_CONFIG["adam_beta1"], TRAIN_CONFIG["adam_beta2"]),
-        eps=TRAIN_CONFIG["adam_epsilon"],
-        weight_decay=TRAIN_CONFIG["weight_decay"]
-    )
-
-    # LR Schedule
-    epochs = TRAIN_CONFIG["epochs_stage2"]
-    update_steps_per_epoch = get_update_steps_per_epoch(len(train_loader), accumulation_steps)
-    total_steps = update_steps_per_epoch * epochs
-    warmup_steps = int(TRAIN_CONFIG["warmup_ratio"] * total_steps)
-    scheduler = CosineAnnealingWithWarmup(optimizer, warmup_steps, total_steps)
-
-    # Mixed Precision
-    use_amp = TRAIN_CONFIG["use_amp_on_cuda"] and device.type == "cuda"
-    scaler = GradScaler(enabled=use_amp)
-
-    # Resume from checkpoint
-    ckpt_name = "stage2_hn_latest.pt" if include_hard_negatives else "stage2_latest.pt"
-    checkpoint_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], ckpt_name)
-    previous_name = "stage2_final.pt" if include_hard_negatives else "stage1_final.pt"
-    previous_stage = "Stage2" if include_hard_negatives else "Stage1"
-    previous_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], previous_name)
-    load_previous_stage_if_needed(model, checkpoint_path, previous_path, device,
-                                  stage_name, previous_stage)
-    extra_modules = {'criterion': criterion} if include_hard_negatives else None
-    start_epoch, start_step = load_checkpoint(
-        model, optimizer, scheduler, checkpoint_path, device,
-        extra_modules=extra_modules
-    )
-
-    total_batch_steps = len(train_loader) * epochs
-    log_every = get_progress_log_every_steps()
-    checkpoint_interval_seconds = max(
-        60.0,
-        float(TRAIN_CONFIG.get("checkpoint_every_minutes", 30)) * 60.0
-    )
-
-    logger.info(f"Epochs: {epochs}, Batch steps: {total_batch_steps}, "
-                f"Optimizer steps: {total_steps}, Warmup: {warmup_steps}")
-    if include_hard_negatives:
-        logger.info(f"Batch size: {batch_size}, Grad accumulation: {accumulation_steps}, "
-                    f"Optimizer effective batch: {batch_size * accumulation_steps}, "
-                    "Objective: PAWS binary SoftmaxLoss")
-    else:
-        logger.info(f"Batch size: {batch_size}, Grad accumulation: {accumulation_steps}, "
-                    f"Optimizer effective batch: {batch_size * accumulation_steps}, "
-                    f"Contrastive negatives per batch: {batch_size - 1}, "
-                    f"Temperature: {TRAIN_CONFIG['temperature']}")
-    log_event(
-        "stage_start",
-        stage=stage_name,
-        epochs=epochs,
-        total_batch_steps=total_batch_steps,
-        scheduler_steps=total_steps,
-        warmup_steps=warmup_steps,
-        batch_size=batch_size,
-        gradient_accumulation_steps=accumulation_steps,
-        use_amp=use_amp,
-        device=str(device),
-        debug=debug,
-        hard_negatives=include_hard_negatives,
-        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
-    )
-
-    # ===== TRAINING LOOP =====
-    model.train()
-    global_step = start_step
-    stage_start_time = time.time()
-    last_checkpoint_time = stage_start_time
-    stop_pipeline_budget = False
-
-    for epoch in range(start_epoch, epochs):
-        epoch_loss = 0.0
-        num_batches = 0
-        optimizer.zero_grad(set_to_none=True)
-
-        for batch_idx, batch in enumerate(train_loader):
-            if global_training_budget_reached(training_deadline):
-                avg_loss_so_far = epoch_loss / max(num_batches, 1)
-                save_checkpoint(model, optimizer, scheduler, epoch, global_step,
-                                avg_loss_so_far, checkpoint_path,
-                                extra_modules=extra_modules,
-                                stage_name=stage_name)
-                log_training_budget_stop(stage_name, global_step, training_deadline)
-                stop_pipeline_budget = True
-                break
-
-            if epoch == start_epoch and batch_idx < (start_step % len(train_loader)):
+            if epoch == start_epoch and batch_idx < global_step % len(train_loader):
                 continue
 
-            ids_a = batch['input_ids_a'].to(device)
-            mask_a = batch['attention_mask_a'].to(device)
-            ids_b = batch['input_ids_b'].to(device)
-            mask_b = batch['attention_mask_b'].to(device)
-            labels = batch['label'].to(device) if include_hard_negatives else None
+            ids = batch["input_ids"].to(device)
+            mask = batch["attention_mask"].to(device)
+            targets = teacher_encode(teacher, tokenizer, ids, device)
 
             with autocast(device_type=device.type, enabled=use_amp):
-                # Encode anchor và positive
-                embedding_a = model(ids_a, mask_a)  # (B, H)
-                embedding_b = model(ids_b, mask_b)  # (B, H)
-
-                if include_hard_negatives:
-                    # Supervised PAWS pair classification: paraphrase vs non-paraphrase.
-                    loss = criterion(embedding_a, embedding_b, labels)
-                else:
-                    # Contrastive loss: cosine similarity matrix + cross-entropy
-                    loss = criterion(embedding_a, embedding_b)
+                loss = criterion(model(ids, mask), targets)
 
             raw_loss = loss.detach()
-            loss = loss / get_accumulation_divisor(batch_idx, len(train_loader), accumulation_steps)
+            loss = loss / accumulation_divisor(batch_idx, len(train_loader), accumulation_steps)
             scaler.scale(loss).backward()
 
-            if should_step_optimizer(batch_idx, len(train_loader), accumulation_steps):
+            if should_step(batch_idx, len(train_loader), accumulation_steps):
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
             epoch_loss += raw_loss.item()
-            num_batches += 1
+            seen_batches += 1
             global_step += 1
 
-            if global_step % log_every == 0:
-                log_progress(
-                    stage_name, epoch + 1, epochs, global_step,
-                    total_batch_steps, epoch_loss, num_batches,
-                    stage_start_time, scheduler.get_lr()
+            if global_step % TRAIN_CONFIG["log_every_steps"] == 0:
+                avg_loss = epoch_loss / max(1, seen_batches)
+                elapsed = max(1e-9, time.time() - start_time)
+                logger.info(
+                    "Epoch %s/%s | step %s/%s | loss %.4f | lr %.2e | %.2f batch/s",
+                    epoch + 1,
+                    TRAIN_CONFIG["epochs"],
+                    global_step,
+                    len(train_loader) * TRAIN_CONFIG["epochs"],
+                    avg_loss,
+                    scheduler.get_lr(),
+                    seen_batches / elapsed,
                 )
 
-            now = time.time()
-            if now - last_checkpoint_time >= checkpoint_interval_seconds:
-                avg_loss_so_far = epoch_loss / max(num_batches, 1)
-                save_checkpoint(model, optimizer, scheduler, epoch, global_step,
-                                avg_loss_so_far, checkpoint_path,
-                                extra_modules=extra_modules,
-                                stage_name=stage_name)
-                last_checkpoint_time = now
+            if global_step % TRAIN_CONFIG["checkpoint_every_steps"] == 0:
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch, global_step,
+                    epoch_loss / max(1, seen_batches), latest_path
+                )
 
-        if stop_pipeline_budget:
-            return False
-
-        spearman = evaluate_stsb(model, eval_loader, device)
-        avg_loss = epoch_loss / max(num_batches, 1)
-        logger.info(f"[{stage_name}] Epoch {epoch+1}/{epochs} DONE | "
-                   f"Avg Loss: {avg_loss:.4f} | STS-B Spearman: {spearman:.4f}")
-        log_event(
-            "epoch_end",
-            stage=stage_name,
-            epoch=epoch + 1,
-            epochs=epochs,
-            global_step=global_step,
-            avg_loss=avg_loss,
-            stsb_spearman=spearman,
-            lr=scheduler.get_lr(),
-            elapsed_sec=time.time() - stage_start_time,
-            hard_negatives=include_hard_negatives,
-            **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
+        val_loss, val_cosine = evaluate_distillation(
+            model, teacher, tokenizer, val_loader, criterion, device, use_amp
         )
-
-        save_checkpoint(model, optimizer, scheduler, epoch + 1, global_step, avg_loss,
-                       checkpoint_path, extra_modules=extra_modules,
-                       stage_name=stage_name)
-
-    final_name = "stage2_hn_final.pt" if include_hard_negatives else "stage2_final.pt"
-    final_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], final_name)
-    torch.save(model.state_dict(), final_path)
-    logger.info(f" Giai đoạn 2 ({stage_name}) hoàn thành. Model saved: {final_path}")
-    log_event(
-        "stage_end",
-        stage=stage_name,
-        final_model_path=final_path,
-        global_step=global_step,
-        elapsed_sec=time.time() - stage_start_time,
-        hard_negatives=include_hard_negatives,
-        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
-    )
-    return True
-
-
-# =============================================================================
-# MAIN — Pipeline hoàn chỉnh
-# =============================================================================
-
-def main():
-    pipeline_start_time = time.time()
-    device = get_device()
-    debug = DEBUG_CONFIG["enabled"]
-    metrics_log_path = str(TRAIN_CONFIG["metrics_log_path"])
-    text_log_path = configure_file_logging(str(TRAIN_CONFIG["checkpoint_dir"]))
-    init_training_logger(metrics_log_path)
-    total_budget_seconds = get_total_train_budget_seconds(debug)
-    training_deadline = (
-        pipeline_start_time + total_budget_seconds
-        if total_budget_seconds is not None
-        else None
-    )
-    storage_cost_usd = estimate_storage_cost_usd()
-    hourly_runtime_cost_usd = estimate_hourly_runtime_cost_usd()
-
-    logger.info("=" * 60)
-    logger.info("SWFT — Shallow-Wide Factorized Transformer")
-    logger.info("Train from scratch — Pure PyTorch")
-    logger.info(f"Device: {device} | Debug: {debug}")
-    logger.info(f"Metrics JSONL: {metrics_log_path}")
-    logger.info(f"Text log: {text_log_path}")
-    if total_budget_seconds is not None:
+        stsb = evaluate_stsb(model, stsb_loader, device)
+        avg_loss = epoch_loss / max(1, seen_batches)
         logger.info(
-            "Global train timer: %s | Runtime $%.3f/h (GPU $%.3f/h + container disk $%.3f/h) | "
-            "Storage %.0fGB/%sd ~= $%.2f | "
-            "Safety buffer $%.2f",
-            format_duration(total_budget_seconds),
-            hourly_runtime_cost_usd,
-            float(BUDGET_CONFIG["gpu_usd_per_hour"]),
-            float(BUDGET_CONFIG["container_disk_usd_per_hour"]),
-            float(BUDGET_CONFIG["storage_gb"]),
-            BUDGET_CONFIG["storage_days"],
-            storage_cost_usd,
-            float(BUDGET_CONFIG["budget_safety_usd"]),
+            "Epoch %s done | train loss %.4f | val loss %.4f | val cosine %.4f | STS-B %.4f",
+            epoch + 1,
+            avg_loss,
+            val_loss,
+            val_cosine,
+            stsb,
         )
-    logger.info("=" * 60)
+        save_checkpoint(model, optimizer, scheduler, epoch + 1, global_step, avg_loss, latest_path)
 
-    # Tạo model
-    model = create_swft_model(MODEL_CONFIG).to(device)
-    total_params = model.count_parameters()
-    logger.info(f"Tổng tham số: {total_params:,} (~{total_params/1e6:.1f}M)")
-    log_event(
-        "training_start",
-        device=str(device),
-        debug=debug,
-        total_params=total_params,
-        metrics_log_path=metrics_log_path,
-        text_log_path=text_log_path,
-        checkpoint_dir=TRAIN_CONFIG["checkpoint_dir"],
-        data_cache_dir=TRAIN_CONFIG["data_cache_dir"],
-        target_train_hours=TRAIN_CONFIG["target_train_hours"],
-        stage0_time_budget_hours=TRAIN_CONFIG["stage0_time_budget_hours"],
-        total_budget_sec=total_budget_seconds,
-        budget_total_usd=BUDGET_CONFIG["total_budget_usd"],
-        budget_gpu_usd_per_hour=BUDGET_CONFIG["gpu_usd_per_hour"],
-        budget_container_disk_usd_per_hour=BUDGET_CONFIG["container_disk_usd_per_hour"],
-        budget_runtime_usd_per_hour=hourly_runtime_cost_usd,
-        budget_storage_gb=BUDGET_CONFIG["storage_gb"],
-        budget_storage_days=BUDGET_CONFIG["storage_days"],
-        budget_storage_estimated_usd=storage_cost_usd,
-        budget_safety_usd=BUDGET_CONFIG["budget_safety_usd"],
-        batch_size=TRAIN_CONFIG["batch_size_debug"] if debug else TRAIN_CONFIG["batch_size_train"],
-        gradient_accumulation_steps=TRAIN_CONFIG["gradient_accumulation_steps"],
-        stage0_teacher_model=TRAIN_CONFIG["stage0_teacher_model"],
-        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
-    )
-
-    # ===== Curriculum Learning (Bengio et al., ICML 2009) =====
-    # Stage 0: supervised teacher-student distillation từ text thô
-    # Stage 1: NLI (dễ — phân loại 3 classes)
-    # Stage 2: Similarity + Hard Negatives (khó nhất — contrastive)
-
-    # Giai đoạn 0: supervised distillation trên Wikipedia
-    if not train_stage0_distillation(model, device, debug=debug,
-                                     training_deadline=training_deadline):
-        cleanup_after_stage(device, "Stage0")
-        log_pipeline_stopped_by_budget("Stage0", pipeline_start_time, total_budget_seconds)
-        return
-    cleanup_after_stage(device, "Stage0")
-
-    # Giai đoạn 1: NLI
-    if not train_stage1_nli(model, device, debug=debug,
-                            training_deadline=training_deadline):
-        cleanup_after_stage(device, "Stage1")
-        log_pipeline_stopped_by_budget("Stage1", pipeline_start_time, total_budget_seconds)
-        return
-    cleanup_after_stage(device, "Stage1")
-
-    # Giai đoạn 2: Similarity contrastive learning trên PAWS
-    if not train_stage2_similarity(model, device, debug=debug,
-                                   include_hard_negatives=False,
-                                   training_deadline=training_deadline):
-        cleanup_after_stage(device, "Stage2")
-        log_pipeline_stopped_by_budget("Stage2", pipeline_start_time, total_budget_seconds)
-        return
-    cleanup_after_stage(device, "Stage2")
-
-    # Giai đoạn 2+: Similarity + Hard Negatives (PAWS adversarial)
-    if not train_stage2_similarity(model, device, debug=debug,
-                                   include_hard_negatives=True,
-                                   training_deadline=training_deadline):
-        cleanup_after_stage(device, "Stage2+HN")
-        log_pipeline_stopped_by_budget("Stage2+HN", pipeline_start_time, total_budget_seconds)
-        return
-    cleanup_after_stage(device, "Stage2+HN")
-
-    logger.info("🎉 HOÀN THÀNH TOÀN BỘ PIPELINE TRAINING!")
-    log_event(
-        "training_complete",
-        checkpoint_dir=TRAIN_CONFIG["checkpoint_dir"],
-        elapsed_sec=time.time() - pipeline_start_time,
-        total_budget_sec=total_budget_seconds,
-        **get_disk_usage(TRAIN_CONFIG["checkpoint_dir"]),
-    )
+    torch.save(model.state_dict(), final_path)
+    logger.info("Saved final model: %s", final_path)
 
 
 if __name__ == "__main__":

@@ -1,146 +1,63 @@
-# =============================================================================
-# evaluate.py — Đánh giá mô hình SWFT trên STS-B, PAWS
-# =============================================================================
-# Bài báo tham khảo:
-#   [1] Cer et al., "STS Benchmark", SemEval@ACL 2017 → Spearman correlation
-#   [2] Zhang et al., "PAWS", NAACL 2019 → Adversarial accuracy
-#   [3] Muennighoff et al., "MTEB", EACL 2023 → Evaluation methodology
-# =============================================================================
-
 import os
 import sys
-import logging
+from typing import Any, cast
+
 import torch
-import torch.nn as nn
-import numpy as np
+import torch.nn.functional as F
 from scipy.stats import spearmanr
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import MODEL_CONFIG, TRAIN_CONFIG, DEBUG_CONFIG, DATA_CONFIG, get_device
-from model.sbert import create_swft_model
-from dataset import get_tokenizer, STSBDataset, PAWSEvalDataset, create_dataloader
-
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger(__name__)
+from config import DATA_CONFIG, MODEL_CONFIG, TRAIN_CONFIG, get_device
+from dataset import STSBDataset, create_dataloader, get_tokenizer
+from model.encoder import create_sftbe_model
 
 
-def evaluate_stsb_full(model, device, debug=True):
-    """
-    Đánh giá trên STS Benchmark — Cer et al., SemEval@ACL 2017.
-    Metric chính: Spearman Correlation ρ (rank correlation)
-    """
-    tokenizer = get_tokenizer(DATA_CONFIG["tokenizer_name"])
-    batch_size = TRAIN_CONFIG["batch_size_debug"] if debug else TRAIN_CONFIG["batch_size_train"]
-    cache_dir = TRAIN_CONFIG.get("data_cache_dir")
-
-    dataset = STSBDataset(cache_dir=cache_dir, tokenizer=tokenizer, split="test", debug=debug,
-                          num_debug_samples=DEBUG_CONFIG["eval_samples"])
-    loader = create_dataloader(dataset, batch_size=batch_size, shuffle=False,
-                               drop_last=False)
-
+def evaluate_stsb(model, loader, device):
     model.eval()
-    all_cosine = []
-    all_labels = []
-
+    predictions, labels = [], []
     with torch.no_grad():
         for batch in loader:
-            ids_a = batch['input_ids_a'].to(device)
-            mask_a = batch['attention_mask_a'].to(device)
-            ids_b = batch['input_ids_b'].to(device)
-            mask_b = batch['attention_mask_b'].to(device)
+            ids_a = batch["input_ids_a"].to(device)
+            mask_a = batch["attention_mask_a"].to(device)
+            ids_b = batch["input_ids_b"].to(device)
+            mask_b = batch["attention_mask_b"].to(device)
 
             emb_a = model(ids_a, mask_a)
             emb_b = model(ids_b, mask_b)
+            cosine = F.cosine_similarity(emb_a, emb_b, dim=-1)
+            predictions.extend(cosine.cpu().tolist())
+            labels.extend(batch["score"].tolist())
 
-            cos_sim = nn.functional.cosine_similarity(emb_a, emb_b, dim=-1)
-            all_cosine.extend(cos_sim.cpu().tolist())
-            all_labels.extend(batch['score'].tolist())
-
-    spearman, p_value = spearmanr(all_cosine, all_labels)
-    logger.info(f" STS-B Test | Spearman ρ = {spearman:.4f} (p={p_value:.2e})")
-    return spearman
-
-
-def evaluate_paws(model, device, debug=True, split="validation"):
-    """
-    Đánh giá trên PAWS — Zhang et al., NAACL 2019.
-    Metric: Accuracy trên adversarial paraphrases.
-    BM25 thường chỉ đạt ~50% trên tập này (vì từ vựng giống nhau).
-    """
-    tokenizer = get_tokenizer(DATA_CONFIG["tokenizer_name"])
-    batch_size = TRAIN_CONFIG["batch_size_debug"] if debug else TRAIN_CONFIG["batch_size_train"]
-    cache_dir = TRAIN_CONFIG.get("data_cache_dir")
-
-    dataset = PAWSEvalDataset(cache_dir=cache_dir, tokenizer=tokenizer, split=split, debug=debug,
-                              num_debug_samples=DEBUG_CONFIG["eval_samples"])
-    loader = create_dataloader(dataset, batch_size=batch_size, shuffle=False,
-                               drop_last=False)
-
-    model.eval()
-    all_cosine = []
-    all_labels = []
-
-    with torch.no_grad():
-        for batch in loader:
-            ids_a = batch['input_ids_a'].to(device)
-            mask_a = batch['attention_mask_a'].to(device)
-            ids_b = batch['input_ids_b'].to(device)
-            mask_b = batch['attention_mask_b'].to(device)
-
-            emb_a = model(ids_a, mask_a)
-            emb_b = model(ids_b, mask_b)
-
-            cos_sim = nn.functional.cosine_similarity(emb_a, emb_b, dim=-1)
-            all_cosine.extend(cos_sim.cpu().tolist())
-            all_labels.extend(batch['label'].tolist())
-
-    # Tìm threshold tối ưu cho binary classification
-    best_acc = 0.0
-    best_threshold = 0.0
-    for threshold in np.arange(0.0, 1.0, 0.01):
-        preds = [1 if s >= threshold else 0 for s in all_cosine]
-        acc = sum(p == l for p, l in zip(preds, all_labels)) / len(all_labels)
-        if acc > best_acc:
-            best_acc = acc
-            best_threshold = threshold
-
-    logger.info(f" PAWS {split} | Threshold-tuned accuracy = {best_acc:.4f} "
-                f"(threshold={best_threshold:.2f})")
-    return best_acc
+    correlation = spearmanr(predictions, labels)[0]
+    return float(cast(Any, correlation))
 
 
 def main():
     device = get_device()
-    debug = DEBUG_CONFIG["enabled"]
+    tokenizer = get_tokenizer(DATA_CONFIG["tokenizer_name"])
+    dataset = STSBDataset(
+        TRAIN_CONFIG["data_cache_dir"],
+        tokenizer,
+        split="test",
+        max_length=MODEL_CONFIG["max_seq_length"],
+    )
+    loader = create_dataloader(
+        dataset,
+        batch_size=TRAIN_CONFIG["batch_size"],
+        shuffle=False,
+        num_workers=0,
+        drop_last=False,
+    )
 
-    logger.info("=" * 60)
-    logger.info("ĐÁNH GIÁ MÔ HÌNH SWFT")
-    logger.info("=" * 60)
-
-    # Tạo model
-    model = create_swft_model(MODEL_CONFIG).to(device)
-
-    # Thử load checkpoint
-    model_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage2_hn_final.pt")
-    if not os.path.exists(model_path):
-        model_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage2_final.pt")
-    if not os.path.exists(model_path):
-        model_path = os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage1_final.pt")
-
-    if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-        logger.info(f"Loaded model: {model_path}")
-    else:
-        logger.warning("Không tìm thấy checkpoint. Đánh giá model chưa train (random weights).")
-
-    # Đánh giá
-    evaluate_stsb_full(model, device, debug=debug)
-    evaluate_paws(model, device, debug=debug)
-
-    logger.info(" Đánh giá hoàn thành!")
+    model = create_sftbe_model(MODEL_CONFIG).to(device)
+    checkpoint = os.environ.get(
+        "SFTBE_EVAL_MODEL_PATH",
+        os.path.join(TRAIN_CONFIG["checkpoint_dir"], "stage0_final.pt"),
+    )
+    model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
+    score = evaluate_stsb(model, loader, device)
+    print(f"STS-B Spearman: {score:.4f}")
 
 
 if __name__ == "__main__":

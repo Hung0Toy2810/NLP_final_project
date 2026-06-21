@@ -1,0 +1,14 @@
+{
+  "checkpoint_path": "checkpoints/stage0_final.pt",
+  "index_dir": "retrieval_system/papers_index",
+  "ollama_host": "http://localhost:11434",
+  "ollama_model": "gemma3:4b",
+  "cross_encoder_model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+  "cross_encoder_batch_size": 32,
+  "vector_top_k": 100,
+  "cross_rerank_k": 10,
+  "llm_rerank_k": 8,
+  "final_context_k": 5,
+  "chunk_max_chars": 900,
+  "chunk_overlap_chars": 120
+}

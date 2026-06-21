@@ -1,0 +1,4 @@
+Document abcxyz is stored in shelf F drawer L.
+Document uvw123 is stored in shelf K drawer L.
+Document report-2024 was moved from shelf K to shelf F on Monday.
+

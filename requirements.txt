@@ -10,13 +10,11 @@ sentence-transformers
 
 # Dataset loading
 datasets
+pypdf
 
 # Evaluation
 scikit-learn
 scipy
-
-# BM25 Baseline
-rank_bm25
 
 # Training support
 accelerate>=1.1.0
