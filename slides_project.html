@@ -1,0 +1,778 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Slide thuyết trình - Xây dựng công cụ tìm kiếm văn bản tương tự</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700;900&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: { roboto: ["Roboto", "Arial", "sans-serif"] },
+          colors: {
+            ink: "#18212f",
+            muted: "#64748b",
+            line: "#d9e2ec",
+            panel: "#f8fafc",
+            blue: "#2563eb",
+            teal: "#0f766e",
+            amber: "#b45309",
+            rose: "#be123c"
+          }
+        }
+      }
+    };
+  </script>
+  <script>
+    window.MathJax = {
+      tex: { inlineMath: [["$", "$"], ["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] },
+      svg: { fontCache: "global" },
+      startup: {
+        pageReady: () => MathJax.startup.defaultPageReady().then(() => {
+          document.documentElement.dataset.mathjaxReady = "true";
+        })
+      }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+  <style>
+    @page { size: 13.333in 7.5in; margin: 0; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: #e5e7eb; font-family: Roboto, Arial, sans-serif; color: #18212f; }
+    body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .slide {
+      width: 13.333in;
+      height: 7.5in;
+      margin: 0 auto;
+      padding: 0.52in 0.62in;
+      background: #ffffff;
+      page-break-after: always;
+      break-after: page;
+      overflow: hidden;
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 0.22in;
+    }
+    .slide:last-child { page-break-after: auto; break-after: auto; }
+    .slide::after {
+      content: attr(data-slide);
+      position: absolute;
+      right: 0.36in;
+      bottom: 0.22in;
+      color: #94a3b8;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .title { font-size: 34px; line-height: 1.13; font-weight: 900; letter-spacing: 0; }
+    .section-title { font-size: 30px; line-height: 1.14; font-weight: 900; letter-spacing: 0; }
+    .subtitle { font-size: 18px; line-height: 1.45; color: #64748b; }
+    .body { font-size: 20px; line-height: 1.42; }
+    .small { font-size: 16px; line-height: 1.42; }
+    .tiny { font-size: 13px; line-height: 1.35; }
+    .chip { border: 1px solid #d9e2ec; border-radius: 999px; padding: 7px 12px; font-size: 13px; font-weight: 700; color: #334155; background: #f8fafc; }
+    .card { border: 1px solid #d9e2ec; border-radius: 8px; background: #f8fafc; padding: 18px; }
+    .note { border: 1px solid #d9e2ec; border-left: 5px solid #0f766e; border-radius: 8px; background: #ffffff; padding: 13px 16px; font-size: 15px; line-height: 1.38; color: #475569; }
+    .note b { color: #18212f; }
+    .metric { border-left: 5px solid #2563eb; background: #f8fafc; padding: 14px 16px; border-radius: 6px; }
+    .metric b { display: block; font-size: 28px; line-height: 1.1; }
+    .metric span { font-size: 14px; color: #64748b; }
+    .formula { background: #f8fafc; border: 1px solid #d9e2ec; border-radius: 8px; padding: 14px 18px; font-size: 19px; }
+    .flow { display: flex; align-items: stretch; gap: 10px; }
+    .flow .node { flex: 1; border: 1px solid #d9e2ec; background: #f8fafc; border-radius: 8px; padding: 14px 12px; text-align: center; font-weight: 700; font-size: 16px; display: flex; align-items: center; justify-content: center; min-height: 64px; }
+    .flow .arrow { width: 22px; display: flex; align-items: center; justify-content: center; color: #64748b; font-size: 24px; font-weight: 900; }
+    table.clean { width: 100%; border-collapse: collapse; font-size: 15px; line-height: 1.32; }
+    table.clean th, table.clean td { border: 1px solid #d9e2ec; padding: 8px 10px; text-align: left; vertical-align: top; }
+    table.clean th { background: #eef4ff; font-weight: 800; }
+    mjx-container[jax="SVG"] { max-width: 100%; }
+    .compact-math mjx-container[jax="SVG"] { font-size: 92% !important; }
+    @media print {
+      html, body { background: #ffffff; }
+      .slide { margin: 0; box-shadow: none; }
+    }
+  </style>
+</head>
+<body class="font-roboto">
+
+<section class="slide justify-center" data-slide="1">
+  <div class="max-w-5xl">
+    <div class="text-sm font-bold text-blue uppercase tracking-wide mb-5">Xử lý ngôn ngữ tự nhiên</div>
+    <h1 class="title text-[44px] leading-tight">Xây dựng công cụ tìm kiếm văn bản tương tự</h1>
+    <p class="subtitle mt-6 max-w-3xl">Semantic retrieval với SFT-BE Bi-Encoder, Cross-Encoder reranking và LLM verifier có citation.</p>
+    <div class="flex flex-wrap gap-3 mt-9">
+      <span class="chip">Bi-Encoder</span>
+      <span class="chip">Teacher-student distillation</span>
+      <span class="chip">Cross-Encoder reranking</span>
+      <span class="chip">Document retrieval</span>
+    </div>
+  </div>
+</section>
+
+<section class="slide" data-slide="2">
+  <h2 class="section-title">Bối cảnh bài toán</h2>
+  <div class="grid grid-cols-2 gap-6 body">
+    <div class="card">
+      <h3 class="font-extrabold text-2xl mb-4">Tìm kiếm từ khóa</h3>
+      <ul class="list-disc pl-6 space-y-3">
+        <li>Phụ thuộc trùng khớp bề mặt.</li>
+        <li>Dễ bỏ sót diễn đạt đồng nghĩa.</li>
+        <li>Khó xử lý câu hỏi tự nhiên.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 class="font-extrabold text-2xl mb-4">Tìm kiếm ngữ nghĩa</h3>
+      <ul class="list-disc pl-6 space-y-3">
+        <li>Ánh xạ query và văn bản vào embedding space.</li>
+        <li>Tìm đoạn gần nghĩa bằng cosine similarity.</li>
+        <li>Có thể kết hợp reranking để tăng precision.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="formula compact-math mt-auto">$$\operatorname{sim}(q,d_i)=\operatorname{cos}(f_\theta(q),f_\theta(d_i))$$</div>
+</section>
+
+<section class="slide" data-slide="3">
+  <h2 class="section-title">Mục tiêu đề tài</h2>
+  <div class="grid grid-cols-2 gap-6 body">
+    <ul class="list-disc pl-7 space-y-3">
+      <li>Xây dựng SFT-BE bằng PyTorch.</li>
+      <li>Encode văn bản thành embedding 768 chiều.</li>
+      <li>Huấn luyện bằng teacher-student distillation.</li>
+      <li>Lập chỉ mục tài liệu PDF thành vector store.</li>
+    </ul>
+    <ul class="list-disc pl-7 space-y-3">
+      <li>Truy vấn bằng semantic search.</li>
+      <li>Rerank bằng Cross-Encoder.</li>
+      <li>Tùy chọn LLM verifier và answer generation.</li>
+      <li>Trả kết quả có citation/context window.</li>
+    </ul>
+  </div>
+  <div class="grid grid-cols-4 gap-4 mt-auto">
+    <div class="metric"><b>768</b><span>chiều embedding</span></div>
+    <div class="metric"><b>6</b><span>Transformer layers</span></div>
+    <div class="metric"><b>30</b><span>paper kiểm thử</span></div>
+    <div class="metric"><b>3,402</b><span>document chunks</span></div>
+  </div>
+</section>
+
+<section class="slide" data-slide="4">
+  <h2 class="section-title">Luồng hệ thống tổng thể</h2>
+  <div class="flow mt-2">
+    <div class="node">Tài liệu PDF/TXT/MD</div><div class="arrow">→</div>
+    <div class="node">Trích xuất text</div><div class="arrow">→</div>
+    <div class="node">Chunking</div><div class="arrow">→</div>
+    <div class="node">SFT-BE encode</div>
+  </div>
+  <div class="flow">
+    <div class="node">Vector store</div><div class="arrow">→</div>
+    <div class="node">Query embedding</div><div class="arrow">→</div>
+    <div class="node">Top-k retrieval</div><div class="arrow">→</div>
+    <div class="node">Rerank + answer</div>
+  </div>
+  <div class="grid grid-cols-3 gap-4">
+    <div class="note"><b>Indexing:</b> làm trước, tốn thời gian hơn nhưng chỉ chạy khi corpus thay đổi.</div>
+    <div class="note"><b>Searching:</b> chỉ encode query rồi so sánh với vector đã lưu.</div>
+    <div class="note"><b>Reranking:</b> đọc kỹ nhóm nhỏ để tăng độ đúng ở top kết quả.</div>
+  </div>
+  <div class="formula compact-math mt-auto">$$\mathcal{R}_{final}=\operatorname{Rerank}(\operatorname{TopK}_{c_i\in\mathcal{C}}\operatorname{cos}(z_q,z_i),q)$$</div>
+</section>
+
+<section class="slide" data-slide="5">
+  <h2 class="section-title">Semantic search</h2>
+  <div class="grid grid-cols-[1.05fr_0.95fr] gap-6">
+    <div class="body">
+      <ul class="list-disc pl-7 space-y-4">
+        <li>Query và chunk được đưa vào cùng một không gian vector.</li>
+        <li>Hai đoạn gần nghĩa có vector gần hướng nhau.</li>
+        <li>Cosine similarity dùng để lấy candidate ban đầu.</li>
+      </ul>
+    </div>
+    <div class="formula compact-math">
+      $$z_q=f_\theta(q),\qquad z_i=f_\theta(d_i)$$
+      $$\operatorname{cos}(z_q,z_i)=\frac{z_q^\top z_i}{\|z_q\|_2\|z_i\|_2}$$
+    </div>
+  </div>
+  <div class="grid grid-cols-2 gap-4 mt-auto">
+    <div class="note"><b>Trực giác:</b> hệ thống không hỏi “có trùng từ không”, mà hỏi “hai vector có cùng hướng nghĩa không”.</div>
+    <div class="note"><b>Giới hạn:</b> embedding có thể làm mờ phủ định, con số hoặc quan hệ chủ thể - đối tượng.</div>
+  </div>
+</section>
+
+<section class="slide" data-slide="6">
+  <h2 class="section-title">Sparse vector và dense vector</h2>
+  <table class="clean">
+    <thead><tr><th>Hướng biểu diễn</th><th>Ưu điểm</th><th>Hạn chế</th><th>Vai trò trong project</th></tr></thead>
+    <tbody>
+      <tr><td><b>Sparse</b><br>TF-IDF/BM25</td><td>Dễ giải thích, tốt với từ khóa hiếm</td><td>Khó hiểu đồng nghĩa và ngữ cảnh</td><td>Tín hiệu phụ qua lexical boost</td></tr>
+      <tr><td><b>Dense</b><br>Embedding</td><td>Mã hóa quan hệ ngữ nghĩa</td><td>Khó giải thích từng chiều</td><td>Tầng retrieval chính bằng SFT-BE</td></tr>
+    </tbody>
+  </table>
+  <div class="grid grid-cols-2 gap-4">
+    <div class="note"><b>Vì sao kết hợp?</b> Dense vector bắt nghĩa rộng, sparse signal giữ lại các token đặc biệt như mã paper hoặc tên riêng.</div>
+    <div class="note"><b>Trong pipeline:</b> lexical boost chỉ là tín hiệu phụ, không thay thế semantic retrieval.</div>
+  </div>
+  <div class="formula compact-math mt-auto">$$s^{base}=0.82\,s^{vec}+0.18\,s^{lex}$$</div>
+</section>
+
+<section class="slide" data-slide="7">
+  <h2 class="section-title">Bi-Encoder: ý tưởng cốt lõi</h2>
+  <div class="grid grid-cols-2 gap-6">
+    <div class="card">
+      <h3 class="font-extrabold text-2xl mb-3">Encode độc lập</h3>
+      <div class="formula compact-math">$$z_q=f_\theta(q),\qquad z_d=f_\theta(d)$$</div>
+      <p class="small mt-4 text-muted">Query và document không tương tác token-level trong lúc encode.</p>
+    </div>
+    <div class="card">
+      <h3 class="font-extrabold text-2xl mb-3">So sánh vector</h3>
+      <div class="formula compact-math">$$score(q,d)=\operatorname{cos}(z_q,z_d)$$</div>
+      <p class="small mt-4 text-muted">Document embedding có thể precompute trước.</p>
+    </div>
+  </div>
+  <div class="grid grid-cols-2 gap-4 mt-auto">
+    <div class="note"><b>Lợi thế chính:</b> mọi document embedding được tính trước nên query mới xử lý nhanh.</div>
+    <div class="note"><b>Vai trò:</b> không cố đọc hiểu sâu; nhiệm vụ là lấy candidate đủ tốt cho reranker.</div>
+  </div>
+</section>
+
+<section class="slide" data-slide="8">
+  <h2 class="section-title">SFT-BE: kiến trúc tổng thể</h2>
+  <div class="grid grid-cols-[0.9fr_1.1fr] gap-6">
+    <table class="clean">
+      <tbody>
+        <tr><th>Tokenizer</th><td>`bert-base-uncased`</td></tr>
+        <tr><th>Max length</th><td>128</td></tr>
+        <tr><th>Factorized dim</th><td>128</td></tr>
+        <tr><th>Hidden size</th><td>768</td></tr>
+        <tr><th>Layers / heads</th><td>6 / 12</td></tr>
+        <tr><th>FFN size</th><td>3072</td></tr>
+        <tr><th>Pooling</th><td>Mean pooling + mask</td></tr>
+      </tbody>
+    </table>
+    <div class="card">
+      <h3 class="font-extrabold text-xl mb-3">Luồng xử lý đầy đủ</h3>
+      <div class="formula compact-math">
+        $$x_{ids},m\rightarrow E(x)\rightarrow H^{(0)}\rightarrow H^{(1)}\rightarrow\cdots\rightarrow H^{(6)}$$
+        $$H^{(6)}\rightarrow \operatorname{MeanPool}(H^{(6)},m)\rightarrow z\in\mathbb{R}^{768}$$
+      </div>
+      <p class="small text-muted mt-3">SFT-BE là encoder-only: nhiệm vụ là nén văn bản thành vector, không sinh chuỗi như decoder.</p>
+    </div>
+  </div>
+  <div class="note mt-auto"><b>Điểm thiết kế:</b> giữ hidden size 768 để học trực tiếp từ teacher `all-mpnet-base-v2`, nhưng giảm độ sâu xuống 6 layer để nhẹ hơn.</div>
+</section>
+
+<section class="slide" data-slide="9">
+  <h2 class="section-title">Tokenization và attention mask</h2>
+  <div class="grid grid-cols-[1.05fr_0.95fr] gap-6">
+    <div class="card">
+      <h3 class="font-extrabold text-xl mb-3">Từ văn bản sang tensor</h3>
+      <div class="formula compact-math">
+        $$x=(w_1,w_2,\ldots,w_L)\rightarrow(t_1,t_2,\ldots,t_{128})$$
+        $$x_{ids}\in\mathbb{N}^{B\times128},\qquad m\in\{0,1\}^{B\times128}$$
+      </div>
+      <p class="small text-muted mt-3">Câu ngắn được padding, câu dài bị truncate về 128 token để batch có shape cố định.</p>
+    </div>
+    <div class="card">
+      <h3 class="font-extrabold text-xl mb-3">Mask cho token thật</h3>
+      <div class="formula compact-math">
+        $$m_i=\begin{cases}1&\text{token thật}\\0&\text{padding}\end{cases}$$
+        $$A_{ij}=\begin{cases}\frac{q_i^\top k_j}{\sqrt{d_k}}&m_j=1\\-\infty&m_j=0\end{cases}$$
+      </div>
+      <p class="small text-muted mt-3">Mask xuất hiện trong self-attention và mean pooling để padding không ảnh hưởng embedding.</p>
+    </div>
+  </div>
+  <div class="note mt-auto"><b>Ý nghĩa thực tế:</b> nếu không dùng mask, padding token sẽ tham gia attention/pooling và làm lệch embedding của câu ngắn.</div>
+</section>
+
+<section class="slide" data-slide="10">
+  <h2 class="section-title">Factorized embedding</h2>
+  <div class="grid grid-cols-2 gap-6">
+    <div class="card">
+      <h3 class="font-extrabold text-xl mb-3">Embedding trực tiếp</h3>
+      <div class="formula compact-math">
+        $$W_{direct}\in\mathbb{R}^{30522\times768}$$
+        $$30522\times768\approx23.4M$$
+      </div>
+      <p class="small text-muted mt-3">Nếu dùng trực tiếp, tầng embedding chiếm rất nhiều tham số.</p>
+    </div>
+    <div class="card">
+      <h3 class="font-extrabold text-xl mb-3">Embedding phân rã</h3>
+      <div class="formula compact-math">
+        $$e_i=W_E[t_i],\qquad h_i^{(0)}=e_iW_P$$
+        $$W_E\in\mathbb{R}^{30522\times128},\quad W_P\in\mathbb{R}^{128\times768}$$
+        $$30522\times128+128\times768\approx4.0M$$
+      </div>
+    </div>
+  </div>
+  <div class="note mt-auto"><b>Ý nghĩa:</b> giảm tham số đầu vào từ khoảng 23.4M xuống 4.0M, nhưng representation bên trong vẫn đủ rộng để học ngữ cảnh.</div>
+</section>
+
+<section class="slide" data-slide="11">
+  <h2 class="section-title">Sinusoidal positional encoding</h2>
+  <div class="grid grid-cols-[0.95fr_1.05fr] gap-6">
+    <div class="body">
+      <ul class="list-disc pl-7 space-y-4">
+        <li>Self-attention nhìn các token như một tập nếu không có vị trí.</li>
+        <li>Positional encoding đưa thứ tự token vào representation.</li>
+        <li>SFT-BE dùng sin/cos nên không tăng tham số học được.</li>
+      </ul>
+    </div>
+    <div class="formula compact-math">
+      $$PE(pos,2i)=\sin\left(\frac{pos}{10000^{2i/d_{model}}}\right)$$
+      $$PE(pos,2i+1)=\cos\left(\frac{pos}{10000^{2i/d_{model}}}\right)$$
+      $$\tilde{h}_i^{(0)}=h_i^{(0)}+PE(i)$$
+      $$x_i^{(0)}=\operatorname{Dropout}(\operatorname{LayerNorm}(\tilde{h}_i^{(0)}))$$
+    </div>
+  </div>
+  <div class="note mt-auto"><b>Vai trò:</b> thứ tự từ rất quan trọng. “the cat bites the dog” và “the dog bites the cat” có cùng token nhưng khác nghĩa.</div>
+</section>
+
+<section class="slide" data-slide="12">
+  <h2 class="section-title">Scaled dot-product attention</h2>
+  <div class="grid grid-cols-[1.05fr_0.95fr] gap-6">
+    <div class="formula compact-math">
+      $$X\in\mathbb{R}^{B\times L\times768}$$
+      $$Q=XW_Q,\qquad K=XW_K,\qquad V=XW_V$$
+      $$A=\frac{QK^\top}{\sqrt{d_k}}+M$$
+      $$\operatorname{Attention}(Q,K,V)=\operatorname{softmax}(A)V$$
+    </div>
+    <div class="body">
+      <ul class="list-disc pl-7 space-y-4">
+        <li>$Q$ hỏi token cần thông tin gì.</li>
+        <li>$K$ cho biết token khác chứa tín hiệu gì.</li>
+        <li>$V$ là nội dung được trộn theo trọng số attention.</li>
+        <li>$M$ chặn padding bằng giá trị rất âm.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="note mt-auto"><b>Trực giác:</b> mỗi token chọn những token khác cần “nghe” để cập nhật biểu diễn theo ngữ cảnh, thay vì đọc câu tuần tự như RNN.</div>
+</section>
+
+<section class="slide" data-slide="13">
+  <h2 class="section-title">Multi-head attention</h2>
+  <div class="grid grid-cols-[0.9fr_1.1fr] gap-6">
+    <div class="body">
+      <ul class="list-disc pl-7 space-y-4">
+        <li>SFT-BE dùng 12 attention heads.</li>
+        <li>Mỗi head học một kiểu quan hệ token khác nhau.</li>
+        <li>Hidden size 768 được chia đều cho các head.</li>
+      </ul>
+    </div>
+    <div class="formula compact-math">
+      $$d_k=\frac{768}{12}=64$$
+      $$\operatorname{head}_r=\operatorname{Attention}(XW_Q^{(r)},XW_K^{(r)},XW_V^{(r)})$$
+      $$\operatorname{MHA}(X)=\operatorname{Concat}(\operatorname{head}_1,\ldots,\operatorname{head}_{12})W_O$$
+    </div>
+  </div>
+  <div class="note mt-auto"><b>Ý nghĩa:</b> nhiều head cho phép mô hình học song song nhiều quan hệ: vị trí gần, từ khóa nội dung, quan hệ cú pháp hoặc tín hiệu ngữ nghĩa.</div>
+</section>
+
+<section class="slide" data-slide="14">
+  <h2 class="section-title">FFN, GELU và Pre-LN block</h2>
+  <div class="grid grid-cols-2 gap-6">
+    <div class="formula compact-math">
+      $$\operatorname{FFN}(x)=\operatorname{GELU}(xW_1+b_1)W_2+b_2$$
+      $$W_1\in\mathbb{R}^{768\times3072},\quad W_2\in\mathbb{R}^{3072\times768}$$
+      $$\operatorname{GELU}(x)=x\Phi(x)$$
+    </div>
+    <div class="formula compact-math">
+      $$\hat{X}^{(\ell)}=\operatorname{LayerNorm}(X^{(\ell)})$$
+      $$Y^{(\ell)}=X^{(\ell)}+\operatorname{Dropout}(\operatorname{MHA}(\hat{X}^{(\ell)}))$$
+      $$X^{(\ell+1)}=Y^{(\ell)}+\operatorname{Dropout}(\operatorname{FFN}(\operatorname{LayerNorm}(Y^{(\ell)})))$$
+    </div>
+  </div>
+  <div class="grid grid-cols-2 gap-4 mt-auto">
+    <div class="note"><b>FFN:</b> biến đổi từng token sau khi token đã thu thập ngữ cảnh từ attention.</div>
+    <div class="note"><b>Pre-LN:</b> đặt LayerNorm trước sub-layer, giúp gradient ổn định hơn khi train từ đầu.</div>
+  </div>
+</section>
+
+<section class="slide" data-slide="15">
+  <h2 class="section-title">Mean pooling có attention mask</h2>
+  <div class="grid grid-cols-[0.95fr_1.05fr] gap-6">
+    <div class="body">
+      <ul class="list-disc pl-7 space-y-4">
+        <li>Transformer trả hidden state cho từng token.</li>
+        <li>Retrieval cần một vector duy nhất cho toàn câu/chunk.</li>
+        <li>Mean pooling tận dụng toàn bộ token thật, không chỉ `[CLS]`.</li>
+      </ul>
+    </div>
+    <div class="formula compact-math">
+      $$H=(h_1,\ldots,h_L),\quad h_i\in\mathbb{R}^{768}$$
+      $$z=\frac{\sum_{i=1}^{L}m_i h_i}{\sum_{i=1}^{L}m_i}$$
+      $$z_k=\frac{\sum_{i=1}^{L}m_i h_{i,k}}{\sum_{i=1}^{L}m_i},\qquad k=1,\ldots,768$$
+    </div>
+  </div>
+  <div class="note mt-auto"><b>Output cuối:</b> $z=f_\theta(x)\in\mathbb{R}^{768}$. Vector này là đại diện cho toàn bộ câu/chunk trong retrieval.</div>
+</section>
+
+<section class="slide" data-slide="16">
+  <h2 class="section-title">Teacher-student distillation</h2>
+  <div class="grid grid-cols-2 gap-6">
+    <div class="card">
+      <h3 class="font-extrabold text-xl mb-3">Teacher</h3>
+      <div class="formula compact-math">$$T(\cdot)=\texttt{all-mpnet-base-v2}$$
+      $$t_i=T(x_i),\qquad t_i\in\mathbb{R}^{768}$$</div>
+      <p class="small text-muted mt-3">Teacher chỉ sinh target embedding, không update tham số.</p>
+    </div>
+    <div class="card">
+      <h3 class="font-extrabold text-xl mb-3">Student</h3>
+      <div class="formula compact-math">$$S_\theta(\cdot)=\text{SFT-BE}$$
+      $$s_i=S_\theta(x_i),\qquad s_i\in\mathbb{R}^{768}$$</div>
+      <p class="small text-muted mt-3">Student nhận gradient để bắt chước embedding space của teacher.</p>
+    </div>
+  </div>
+  <div class="note mt-auto"><b>Điểm quan trọng:</b> mô hình học từ embedding mục tiêu, không cần label class hay cặp câu được gán nhãn thủ công.</div>
+</section>
+
+<section class="slide" data-slide="17">
+  <h2 class="section-title">Cosine distillation loss</h2>
+  <div class="grid grid-cols-[1.05fr_0.95fr] gap-6">
+    <div class="formula compact-math">
+      $$\hat{s}_i=\frac{s_i}{\|s_i\|_2},\qquad \hat{t}_i=\frac{t_i}{\|t_i\|_2}$$
+      $$\operatorname{cos}(s_i,t_i)=\hat{s}_i^\top\hat{t}_i$$
+      $$\mathcal{L}_{i}=1-\operatorname{cos}(s_i,t_i)$$
+      $$\mathcal{L}_{batch}=1-\frac{1}{B}\sum_{i=1}^{B}\hat{s}_i^\top\hat{t}_i$$
+    </div>
+    <div class="body">
+      <ul class="list-disc pl-7 space-y-4">
+        <li>Loss thấp nghĩa là hướng vector student gần teacher.</li>
+        <li>Không cần nhãn thủ công cho cặp query-document.</li>
+        <li>Phù hợp để pretrain sentence/document embedding.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="note mt-auto"><b>Cách đọc loss:</b> nếu loss = 0.0736 thì cosine xấp xỉ 0.9264; nghĩa là student đã gần hướng vector của teacher.</div>
+</section>
+
+<section class="slide" data-slide="18">
+  <h2 class="section-title">Dữ liệu huấn luyện</h2>
+  <div class="grid grid-cols-2 gap-6">
+    <div class="card body">
+      <b>Wikipedia sentence-level</b>
+      <ul class="list-disc pl-7 mt-4 space-y-3">
+        <li>`wikimedia/wikipedia, 20231101.en`</li>
+        <li>Lọc câu từ 20 đến 500 ký tự</li>
+        <li>Tokenize bằng `bert-base-uncased`</li>
+      </ul>
+    </div>
+    <div class="card body">
+      <b>Quy mô Stage 0</b>
+      <ul class="list-disc pl-7 mt-4 space-y-3">
+        <li>90,250,685 sentence sau xử lý</li>
+        <li>88,445,671 train samples</li>
+        <li>1,805,014 validation samples</li>
+      </ul>
+    </div>
+  </div>
+  <div class="grid grid-cols-[0.8fr_1.2fr] gap-4 mt-auto">
+    <div class="formula compact-math">$$20\leq \operatorname{len}(sentence)\leq 500$$</div>
+    <div class="note"><b>Lý do lọc:</b> câu quá ngắn thiếu ngữ cảnh, câu quá dài dễ bị truncate mạnh ở giới hạn 128 token.</div>
+  </div>
+</section>
+
+<section class="slide" data-slide="19">
+  <h2 class="section-title">Tối ưu hóa khi huấn luyện</h2>
+  <div class="grid grid-cols-2 gap-6">
+    <div class="formula compact-math">
+      $$m_t=\beta_1m_{t-1}+(1-\beta_1)g_t$$
+      $$v_t=\beta_2v_{t-1}+(1-\beta_2)g_t^2$$
+      $$\theta_t=\theta_{t-1}-\eta\left(\frac{\hat{m}_t}{\sqrt{\hat{v}_t}+\epsilon}+\lambda\theta_{t-1}\right)$$
+    </div>
+    <div class="formula compact-math">
+      $$\eta_t=\eta_{\max}\frac{t}{T_w},\quad t\leq T_w$$
+      $$\eta_t=\frac{1}{2}\eta_{\max}\left(1+\cos\left(\pi\frac{t-T_w}{T-T_w}\right)\right)$$
+      $$B_{eff}=B\times K=16\times8=128$$
+    </div>
+  </div>
+  <div class="note mt-auto"><b>Tóm lại:</b> AdamW kiểm soát cập nhật, warmup tránh sốc gradient ban đầu, cosine schedule giảm LR mượt và accumulation mô phỏng batch lớn.</div>
+</section>
+
+<section class="slide" data-slide="20">
+  <h2 class="section-title">Cross-Encoder reranking</h2>
+  <div class="grid grid-cols-[0.95fr_1.05fr] gap-6">
+    <div class="body">
+      <ul class="list-disc pl-7 space-y-4">
+        <li>Dùng pretrained `cross-encoder/ms-marco-MiniLM-L6-v2`.</li>
+        <li>Không huấn luyện lại trong đề tài.</li>
+        <li>Đọc query và passage trong cùng một sequence.</li>
+        <li>Phù hợp để rerank nhóm candidate nhỏ.</li>
+      </ul>
+    </div>
+    <div class="formula compact-math">
+      $$x=[\mathrm{CLS}],q_1,\ldots,q_m,[\mathrm{SEP}],p_1,\ldots,p_n,[\mathrm{SEP}]$$
+      $$x_{ids},\;x_{seg},\;m$$
+      $$score(q,p)=g_\phi([q;p])$$
+    </div>
+  </div>
+  <div class="note mt-auto"><b>Khác với Bi-Encoder:</b> query token có thể attention trực tiếp tới passage token, nên mô hình phân biệt tốt hơn các chi tiết như phủ định, số liệu và entity.</div>
+</section>
+
+<section class="slide" data-slide="21">
+  <h2 class="section-title">Cấu hình Cross-Encoder</h2>
+  <table class="clean">
+    <tbody>
+      <tr><th>Model</th><td>`cross-encoder/ms-marco-MiniLM-L6-v2`</td><th>Architecture</th><td>`BertForSequenceClassification`</td></tr>
+      <tr><th>Hidden size</th><td>384</td><th>Layers</th><td>6</td></tr>
+      <tr><th>Attention heads</th><td>12</td><th>Head dim</th><td>32</td></tr>
+      <tr><th>Intermediate size</th><td>1536</td><th>Max position</th><td>512</td></tr>
+      <tr><th>Type vocab</th><td>2</td><th>Output</th><td>1 relevance score</td></tr>
+    </tbody>
+  </table>
+  <div class="note mt-auto"><b>Đánh đổi:</b> Cross-Encoder chính xác hơn ở từng cặp query-passage, nhưng phải forward theo từng candidate nên chỉ dùng sau bước lọc rộng.</div>
+</section>
+
+<section class="slide" data-slide="22">
+  <h2 class="section-title">Cross-Encoder: embedding và score</h2>
+  <div class="grid grid-cols-2 gap-6">
+    <div class="formula compact-math">
+      $$s_i=\begin{cases}0&\text{query/special trước passage}\\1&\text{passage}\end{cases}$$
+      $$h_i^{(0)}=E_{tok}(t_i)+E_{pos}(i)+E_{seg}(s_i)$$
+      $$E_{tok}\in\mathbb{R}^{30522\times384},\quad E_{seg}\in\mathbb{R}^{2\times384}$$
+    </div>
+    <div class="formula compact-math">
+      $$u=\tanh(W_{pool}h_{[\mathrm{CLS}]}+b_{pool})$$
+      $$r=W_{cls}u+b_{cls}$$
+      $$s^{cross}\in(0,1),\qquad s^{final}=s^{cross}$$
+    </div>
+  </div>
+  <div class="note mt-auto"><b>Cách dùng trong hệ thống:</b> score không cần diễn giải như xác suất tuyệt đối; nó chủ yếu là điểm relevance tương đối để sắp xếp các candidate.</div>
+</section>
+
+<section class="slide" data-slide="23">
+  <h2 class="section-title">Bi-Encoder vs Cross-Encoder</h2>
+  <table class="clean">
+    <thead><tr><th>Tiêu chí</th><th>Bi-Encoder</th><th>Cross-Encoder</th></tr></thead>
+    <tbody>
+      <tr><td><b>Input</b></td><td>Encode query/document độc lập</td><td>Ghép query-passage thành một sequence</td></tr>
+      <tr><td><b>Tương tác token</b></td><td>Không có trước cosine</td><td>Có trong từng attention layer</td></tr>
+      <tr><td><b>Tốc độ</b></td><td>Nhanh, precompute được</td><td>Chậm hơn, chạy theo từng cặp</td></tr>
+      <tr><td><b>Vai trò</b></td><td>First-stage retriever</td><td>Reranker top-k</td></tr>
+    </tbody>
+  </table>
+  <div class="grid grid-cols-[1.2fr_0.8fr] gap-4 mt-auto">
+    <div class="formula compact-math">$$\text{SFT-BE top 100}\rightarrow\text{Cross-Encoder top 10}\rightarrow\text{optional LLM top 8}\rightarrow\text{final top 5}$$</div>
+    <div class="note"><b>Chiến lược:</b> lấy rộng bằng mô hình nhanh, đọc kỹ bằng mô hình chính xác.</div>
+  </div>
+</section>
+
+<section class="slide" data-slide="24">
+  <h2 class="section-title">Xây dựng chỉ mục vector</h2>
+  <div class="grid grid-cols-[0.9fr_1.1fr] gap-6">
+    <div class="body">
+      <ul class="list-disc pl-7 space-y-4">
+        <li>PDF được trích xuất text theo trang.</li>
+        <li>Text được chuẩn hóa và chia chunk.</li>
+        <li>Mỗi chunk lưu embedding và metadata.</li>
+      </ul>
+    </div>
+    <div class="formula compact-math">
+      $$z_i=f_\theta(c_i),\qquad \hat{z}_i=\frac{z_i}{\|z_i\|_2}$$
+      $$Z=\begin{bmatrix}\hat{z}_1^\top\\ \hat{z}_2^\top\\ \vdots\\ \hat{z}_N^\top\end{bmatrix}\in\mathbb{R}^{N\times768}$$
+    </div>
+  </div>
+  <div class="note mt-auto"><b>Metadata:</b> paper, section, page và chunk index không tham gia trực tiếp vào cosine, nhưng quyết định khả năng trích dẫn và kiểm chứng nguồn.</div>
+</section>
+
+<section class="slide" data-slide="25">
+  <h2 class="section-title">Dataset paper dùng cho retrieval</h2>
+  <div class="grid grid-cols-2 gap-6">
+    <table class="clean">
+      <thead><tr><th>Chủ đề</th><th>Số PDF</th></tr></thead>
+      <tbody>
+        <tr><td>culture</td><td>5</td></tr>
+        <tr><td>linguistics</td><td>5</td></tr>
+        <tr><td>literature</td><td>5</td></tr>
+        <tr><td>politics</td><td>5</td></tr>
+        <tr><td>psychology</td><td>5</td></tr>
+        <tr><td>sociology</td><td>5</td></tr>
+      </tbody>
+    </table>
+    <div class="grid grid-cols-2 gap-4">
+      <div class="metric"><b>30</b><span>PDF học thuật</span></div>
+      <div class="metric"><b>3,402</b><span>chunks</span></div>
+      <div class="metric"><b>768</b><span>vector dim</span></div>
+      <div class="metric"><b>46.58s</b><span>thời gian build index</span></div>
+    </div>
+  </div>
+  <div class="note mt-auto"><b>Vai trò dataset paper:</b> tập này không dùng để train SFT-BE; nó dùng để kiểm thử retrieval trên tài liệu học thuật thực tế.</div>
+</section>
+
+<section class="slide" data-slide="26">
+  <h2 class="section-title">Pipeline truy vấn</h2>
+  <div class="flow">
+    <div class="node">Query</div><div class="arrow">→</div>
+    <div class="node">SFT-BE encode</div><div class="arrow">→</div>
+    <div class="node">Vector search</div><div class="arrow">→</div>
+    <div class="node">Lexical boost</div>
+  </div>
+  <div class="flow">
+    <div class="node">Cross-Encoder</div><div class="arrow">→</div>
+    <div class="node">LLM verifier</div><div class="arrow">→</div>
+    <div class="node">Citation</div><div class="arrow">→</div>
+    <div class="node">Answer</div>
+  </div>
+  <div class="grid grid-cols-[1.35fr_0.65fr] gap-4 mt-auto">
+    <div class="formula compact-math">$$s_i^{base}=0.82s_i^{vec}+0.18s_i^{lex},\qquad s_i^{final}=0.25s_i^{cross}+0.75s_i^{llm}$$</div>
+    <div class="note"><b>Fallback:</b> nếu LLM lỗi, hệ thống vẫn trả kết quả sau Cross-Encoder.</div>
+  </div>
+</section>
+
+<section class="slide" data-slide="27">
+  <h2 class="section-title">LLM verifier và answer generation</h2>
+  <div class="grid grid-cols-2 gap-6 body">
+    <div class="card">
+      <h3 class="font-extrabold text-2xl mb-3">Verifier</h3>
+      <ul class="list-disc pl-6 space-y-3">
+        <li>Chấm lại evidence theo query.</li>
+        <li>Chú ý phủ định, số liệu, entity.</li>
+        <li>Fallback nếu LLM lỗi hoặc parse lỗi.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 class="font-extrabold text-2xl mb-3">Answer</h3>
+      <ul class="list-disc pl-6 space-y-3">
+        <li>Chỉ trả lời dựa trên retrieved context.</li>
+        <li>Mỗi claim cần citation.</li>
+        <li>Nói rõ nếu bằng chứng chưa đủ.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="grid grid-cols-[0.9fr_1.1fr] gap-4 mt-auto">
+    <div class="formula compact-math">$$A=\operatorname{LLM}(q,\mathcal{E})$$</div>
+    <div class="note"><b>Nguyên tắc:</b> LLM chỉ diễn đạt từ evidence đã truy xuất; nếu evidence thiếu thì phải nói thiếu, không tự bịa.</div>
+  </div>
+</section>
+
+<section class="slide" data-slide="28">
+  <h2 class="section-title">Kết quả huấn luyện Stage 0</h2>
+  <table class="clean">
+    <thead><tr><th>Mốc</th><th>Global step</th><th>Thời gian</th><th>Learning rate</th><th>Interval loss</th><th>Cosine xấp xỉ</th></tr></thead>
+    <tbody>
+      <tr><td>Đầu train</td><td>500</td><td>0.02h</td><td>6.36e-7</td><td>0.8575</td><td>0.1425</td></tr>
+      <tr><td>25% log</td><td>678,500</td><td>10.28h</td><td>4.92e-4</td><td>0.1334</td><td>0.8666</td></tr>
+      <tr><td>50% log</td><td>1,356,500</td><td>20.71h</td><td>4.12e-4</td><td>0.0950</td><td>0.9050</td></tr>
+      <tr><td>75% log</td><td>2,034,000</td><td>32.14h</td><td>2.75e-4</td><td>0.0819</td><td>0.9181</td></tr>
+      <tr><td>Cuối train</td><td>2,712,000</td><td>42.39h</td><td>1.29e-4</td><td>0.0736</td><td>0.9264</td></tr>
+    </tbody>
+  </table>
+  <div class="grid grid-cols-[0.7fr_1.3fr] gap-4 mt-auto">
+    <div class="formula compact-math">$$\mathcal{L}=1-\operatorname{cos}(student,teacher)$$</div>
+    <div class="note"><b>Xu hướng:</b> loss giảm rất nhanh ở giai đoạn đầu, sau đó giảm chậm hơn khi student đã gần teacher embedding space.</div>
+  </div>
+</section>
+
+<section class="slide" data-slide="29">
+  <h2 class="section-title">Đánh giá trên 10MB cuối Wikipedia</h2>
+  <div class="grid grid-cols-4 gap-4">
+    <div class="metric"><b>47,959</b><span>câu sau lọc</span></div>
+    <div class="metric"><b>0.06567</b><span>test loss</span></div>
+    <div class="metric"><b>0.93433</b><span>cosine trung bình</span></div>
+    <div class="metric"><b>802.78s</b><span>thời gian test</span></div>
+  </div>
+  <div class="grid grid-cols-2 gap-6 mt-5">
+    <div class="card body">
+      <b>Ý nghĩa</b>
+      <p class="mt-3 text-muted">Student giữ được hướng embedding gần teacher trên tail-slice Wikipedia.</p>
+    </div>
+    <div class="card body">
+      <b>Không thổi phồng</b>
+      <p class="mt-3 text-muted">Đây là đánh giá distillation, không phải accuracy QA hay reasoning.</p>
+    </div>
+  </div>
+  <div class="note mt-auto"><b>Cách hiểu đúng:</b> cosine 0.93433 là độ gần với teacher embedding, không phải tỉ lệ trả lời đúng câu hỏi.</div>
+</section>
+
+<section class="slide" data-slide="30">
+  <h2 class="section-title">Kiểm thử retrieval và reranking</h2>
+  <div class="grid grid-cols-2 gap-6 body">
+    <div class="card">
+      <h3 class="font-extrabold text-2xl mb-3">Test logic</h3>
+      <ul class="list-disc pl-6 space-y-3">
+        <li>Cross-Encoder sort theo cross score.</li>
+        <li>Passage rerank chứa metadata + chunk text.</li>
+        <li>Query rỗng bị từ chối.</li>
+        <li>Pipeline trả final top 5.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 class="font-extrabold text-2xl mb-3">Test truy vấn thực tế</h3>
+      <ul class="list-disc pl-6 space-y-3">
+        <li>Câu hỏi cụ thể trên paper `2606.07245`.</li>
+        <li>Retrieval trỏ đúng paper/page.</li>
+        <li>Câu gài sai được hệ thống phản bác.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="note mt-auto"><b>Ý nghĩa kiểm thử:</b> các test xác nhận luồng kỹ thuật chạy đúng; benchmark định lượng retrieval vẫn cần bộ query có nhãn riêng.</div>
+</section>
+
+<section class="slide" data-slide="31">
+  <h2 class="section-title">Vai trò các thành phần</h2>
+  <table class="clean">
+    <thead><tr><th>Thành phần</th><th>Ưu điểm</th><th>Hạn chế</th><th>Vai trò</th></tr></thead>
+    <tbody>
+      <tr><td>SFT-BE</td><td>Nhanh, precompute được</td><td>Không tương tác token-level</td><td>First-stage retriever</td></tr>
+      <tr><td>Lexical boost</td><td>Giữ tên riêng, mã paper, con số</td><td>Không hiểu đồng nghĩa</td><td>Bổ sung vector score</td></tr>
+      <tr><td>Cross-Encoder</td><td>Đọc kỹ query-passage</td><td>Chậm hơn</td><td>Reranking top-k</td></tr>
+      <tr><td>LLM verifier</td><td>Kiểm tra bằng chứng</td><td>Phụ thuộc Ollama</td><td>Verification tùy chọn</td></tr>
+      <tr><td>Vector store</td><td>Đơn giản, kiểm soát được</td><td>Chưa tối ưu triệu vector</td><td>Lưu và truy xuất embedding</td></tr>
+    </tbody>
+  </table>
+  <div class="note mt-auto"><b>Tinh thần thiết kế:</b> mỗi thành phần xử lý một điểm yếu của tầng trước, thay vì kỳ vọng một mô hình duy nhất làm tốt mọi việc.</div>
+</section>
+
+<section class="slide" data-slide="32">
+  <h2 class="section-title">Phân tích lỗi</h2>
+  <div class="grid grid-cols-2 gap-5 body">
+    <div class="card"><b>PDF extraction</b><br><span class="text-muted">Layout nhiều cột, bảng hoặc text layer lỗi làm sai thứ tự văn bản.</span></div>
+    <div class="card"><b>Chunking</b><br><span class="text-muted">Có thể cắt ngang định nghĩa hoặc lập luận dài.</span></div>
+    <div class="card"><b>Embedding</b><br><span class="text-muted">Stage 0 học từ Wikipedia, chưa tối ưu mọi paper khoa học.</span></div>
+    <div class="card"><b>Query quá chung</b><br><span class="text-muted">Một từ như “politics” không đủ ý định truy vấn.</span></div>
+  </div>
+  <div class="note mt-auto"><b>Sự khác biệt quan trọng:</b> similarity không luôn đồng nghĩa với relevance; cùng chủ đề chưa chắc trả lời đúng câu hỏi.</div>
+</section>
+
+<section class="slide" data-slide="33">
+  <h2 class="section-title">Hạn chế hiện tại</h2>
+  <div class="grid grid-cols-2 gap-6 body">
+    <ul class="list-disc pl-7 space-y-4">
+      <li>Chưa đọc trực tiếp DOCX trong retrieval pipeline.</li>
+      <li>Chưa có OCR cho PDF scan.</li>
+      <li>Chưa có benchmark retrieval có nhãn cho 30 paper.</li>
+    </ul>
+    <ul class="list-disc pl-7 space-y-4">
+      <li>Chunking còn đơn giản với layout phức tạp.</li>
+      <li>LLM verifier phụ thuộc Ollama/model local.</li>
+      <li>Chưa hỗ trợ multi-hop retrieval trên nhiều vùng xa nhau.</li>
+    </ul>
+  </div>
+  <div class="note mt-auto"><b>Cách trình bày trung thực:</b> hệ thống đã chạy được end-to-end, nhưng chưa nên báo Precision@k/MRR khi chưa có nhãn retrieval.</div>
+</section>
+
+<section class="slide" data-slide="34">
+  <h2 class="section-title">Hướng phát triển</h2>
+  <div class="grid grid-cols-2 gap-5 body">
+    <div class="card"><b>Ingestion tốt hơn</b><br><span class="text-muted">DOCX, HTML, OCR, giữ heading/table metadata.</span></div>
+    <div class="card"><b>Benchmark riêng</b><br><span class="text-muted">Query có nhãn để đo Precision@k, Recall@k, MRR, nDCG.</span></div>
+    <div class="card"><b>Fine-tune domain</b><br><span class="text-muted">Title-abstract, citation context, hard negatives.</span></div>
+    <div class="card"><b>Vector database</b><br><span class="text-muted">FAISS, Chroma hoặc Milvus cho corpus lớn.</span></div>
+  </div>
+  <div class="note mt-auto"><b>Hướng quan trọng nhất:</b> xây dựng benchmark có nhãn để so sánh vector-only, vector + lexical, Cross-Encoder và LLM verifier.</div>
+</section>
+
+<section class="slide justify-center" data-slide="35">
+  <h2 class="title text-[42px]">Kết luận</h2>
+  <div class="grid grid-cols-3 gap-5 mt-8 body">
+    <div class="card"><b>Hoàn chỉnh pipeline</b><br><span class="text-muted">Từ train embedding đến retrieval ứng dụng.</span></div>
+    <div class="card"><b>Kết quả khả thi</b><br><span class="text-muted">Cosine trung bình 0.93433 với teacher trên tail Wikipedia.</span></div>
+    <div class="card"><b>Có thể kiểm chứng</b><br><span class="text-muted">Trả kết quả kèm citation và context window.</span></div>
+  </div>
+  <p class="subtitle mt-8 max-w-4xl">SFT-BE đảm nhiệm truy xuất nhanh, Cross-Encoder tăng chất lượng xếp hạng, LLM verifier hỗ trợ kiểm tra bằng chứng khi cần.</p>
+</section>
+
+</body>
+</html>

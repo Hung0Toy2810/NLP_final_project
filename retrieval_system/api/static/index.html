@@ -1,0 +1,667 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SFT-BE Paper Assistant</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #172033;
+      background: #eef2f7;
+    }
+    button, textarea, input { font: inherit; }
+    .app {
+      height: 100vh;
+      display: grid;
+      grid-template-columns: 300px minmax(420px, 1fr) 390px;
+      gap: 14px;
+      padding: 14px;
+    }
+    .panel {
+      min-height: 0;
+      border: 1px solid #d8e0ea;
+      border-radius: 8px;
+      background: #ffffff;
+      overflow: hidden;
+      box-shadow: 0 14px 38px rgba(15, 23, 42, 0.08);
+    }
+    .sidebar, .assistant { display: flex; flex-direction: column; }
+    .header {
+      padding: 16px 16px 13px;
+      border-bottom: 1px solid #e2e8f0;
+      background: linear-gradient(180deg, #ffffff, #f8fafc);
+    }
+    .eyebrow {
+      margin: 0 0 6px;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #2563eb;
+    }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: 19px; line-height: 1.2; }
+    h2 { font-size: 17px; line-height: 1.25; }
+    .muted { color: #64748b; }
+    .small { font-size: 13px; line-height: 1.38; }
+    .searchbox { padding: 12px 14px; border-bottom: 1px solid #e2e8f0; }
+    .searchbox input {
+      width: 100%;
+      height: 38px;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      padding: 0 11px;
+      outline: none;
+      background: #f8fafc;
+    }
+    .searchbox input:focus { border-color: #2563eb; background: #ffffff; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12); }
+    .paper-list { flex: 1; min-height: 0; overflow: auto; padding: 10px; }
+    .library-tools {
+      border-bottom: 1px solid #e2e8f0;
+      padding: 10px 12px;
+      background: #fbfdff;
+    }
+    .tool-title {
+      font-size: 12px;
+      font-weight: 900;
+      color: #172033;
+      margin-bottom: 8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .tool-grid { display: grid; grid-template-columns: 1fr auto; gap: 7px; margin-bottom: 8px; }
+    .tool-input, .tool-select {
+      width: 100%;
+      height: 34px;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      padding: 0 9px;
+      background: #ffffff;
+      color: #172033;
+      outline: none;
+      font-size: 12px;
+    }
+    .tool-select { cursor: pointer; }
+    .mini-btn {
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      background: #ffffff;
+      height: 34px;
+      padding: 0 9px;
+      font-size: 12px;
+      font-weight: 900;
+      color: #172033;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .mini-btn.primary { border-color: #2563eb; background: #2563eb; color: #ffffff; }
+    .mini-btn.danger { border-color: #fecdd3; background: #fff1f2; color: #be123c; }
+    .mini-btn:hover { filter: brightness(0.98); }
+    .arxiv-results {
+      max-height: 210px;
+      overflow: auto;
+      display: grid;
+      gap: 7px;
+      margin-top: 8px;
+    }
+    .arxiv-card {
+      border: 1px solid #d8e0ea;
+      border-radius: 8px;
+      background: #ffffff;
+      padding: 9px;
+    }
+    .arxiv-card b { display: block; font-size: 12px; line-height: 1.28; margin-bottom: 5px; }
+    .arxiv-card p { font-size: 11px; line-height: 1.35; color: #64748b; }
+    .arxiv-actions { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+    .paper-item {
+      width: 100%;
+      display: block;
+      text-align: left;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      background: transparent;
+      padding: 11px 10px;
+      cursor: pointer;
+      color: #172033;
+    }
+    .paper-item:hover { background: #f1f5f9; border-color: #e2e8f0; }
+    .paper-item.active { background: #eff6ff; border-color: #93c5fd; }
+    .paper-title { font-size: 13px; font-weight: 800; line-height: 1.28; }
+    .paper-meta { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      height: 22px;
+      border-radius: 999px;
+      padding: 0 8px;
+      background: #f1f5f9;
+      color: #475569;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .viewer { display: flex; flex-direction: column; min-width: 0; }
+    .viewer-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 16px;
+      border-bottom: 1px solid #e2e8f0;
+      background: #ffffff;
+    }
+    .viewer-title { min-width: 0; }
+    .viewer-title h2 {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .toolbar { display: flex; gap: 8px; flex-shrink: 0; }
+    .btn {
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #172033;
+      min-height: 36px;
+      padding: 0 12px;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    .btn:hover { background: #f8fafc; }
+    .btn.primary { border-color: #2563eb; background: #2563eb; color: #ffffff; }
+    .btn.primary:hover { background: #1d4ed8; }
+    .pdf-wrap { flex: 1; min-height: 0; background: #dbe3ef; }
+    .pdf-frame { width: 100%; height: 100%; border: 0; display: block; background: #f8fafc; }
+    .empty-view {
+      height: 100%;
+      display: grid;
+      place-items: center;
+      padding: 32px;
+      color: #64748b;
+      text-align: center;
+    }
+    .chat-log {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding: 14px;
+      background: #f8fafc;
+    }
+    .bubble {
+      border: 1px solid #d8e0ea;
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 12px;
+      background: #ffffff;
+      font-size: 14px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    .bubble.user { background: #eff6ff; border-color: #bfdbfe; }
+    .bubble.system { background: #f0fdfa; border-color: #99f6e4; }
+    .result-card {
+      border: 1px solid #d8e0ea;
+      border-radius: 8px;
+      padding: 10px;
+      margin-top: 10px;
+      background: #ffffff;
+    }
+    .result-card button {
+      margin-top: 8px;
+      height: 30px;
+      padding: 0 9px;
+      border: 1px solid #cbd5e1;
+      border-radius: 7px;
+      background: #f8fafc;
+      font-size: 12px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    .composer {
+      border-top: 1px solid #e2e8f0;
+      padding: 12px;
+      background: #ffffff;
+    }
+    textarea {
+      width: 100%;
+      min-height: 92px;
+      max-height: 170px;
+      resize: vertical;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      padding: 11px;
+      outline: none;
+      background: #f8fafc;
+      color: #172033;
+    }
+    textarea:focus { border-color: #2563eb; background: #ffffff; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12); }
+    .controls { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; }
+    label.check { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 800; color: #475569; }
+    .status { padding: 8px 14px; border-top: 1px solid #e2e8f0; font-size: 12px; color: #64748b; background: #ffffff; }
+    .spinner {
+      display: inline-block;
+      width: 13px;
+      height: 13px;
+      border: 2px solid #bfdbfe;
+      border-top-color: #2563eb;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      vertical-align: -2px;
+      margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (max-width: 1100px) {
+      .app { grid-template-columns: 260px minmax(360px, 1fr); grid-template-rows: minmax(0, 1fr) 390px; }
+      .assistant { grid-column: 1 / -1; }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <aside class="panel sidebar">
+      <div class="header">
+        <p class="eyebrow">Paper Library</p>
+        <h1>Danh sách paper</h1>
+        <p class="small muted" id="paperCount">Đang tải...</p>
+      </div>
+      <div class="searchbox">
+        <input id="paperSearch" placeholder="Tìm theo mã, tên, chủ đề..." autocomplete="off">
+      </div>
+      <div class="library-tools">
+        <div class="tool-title">Quản lý corpus <span class="muted" id="folderCount"></span></div>
+        <div class="tool-grid">
+          <input class="tool-input" id="folderName" placeholder="Thư mục mới, ví dụ: cs">
+          <button class="mini-btn" id="createFolderBtn">Thêm</button>
+        </div>
+        <div class="tool-grid">
+          <select class="tool-select" id="folderSelect"></select>
+          <button class="mini-btn danger" id="deleteFolderBtn">Xóa thư mục</button>
+        </div>
+        <div class="tool-grid">
+          <input class="tool-input" id="arxivQuery" placeholder="Search arXiv: reranking, RAG...">
+          <button class="mini-btn primary" id="arxivSearchBtn">Search</button>
+        </div>
+        <div class="tool-grid">
+          <button class="mini-btn danger" id="deletePaperBtn">Xóa paper đang mở</button>
+          <button class="mini-btn primary" id="rebuildIndexBtn">Vectorize lại</button>
+        </div>
+        <div class="small muted" id="corpusStatus">Tải/xóa paper xong hãy vectorize lại.</div>
+        <div class="arxiv-results" id="arxivResults"></div>
+      </div>
+      <div class="paper-list" id="paperList"></div>
+    </aside>
+
+    <section class="panel viewer">
+      <div class="viewer-top">
+        <div class="viewer-title">
+          <p class="eyebrow" id="viewerCategory">Paper Viewer</p>
+          <h2 id="viewerTitle">Chọn một paper để đọc</h2>
+          <p class="small muted" id="viewerPath">PDF sẽ được mở ở khu vực này.</p>
+        </div>
+        <div class="toolbar">
+          <button class="btn" id="openNewTabBtn">Mở tab mới</button>
+          <button class="btn primary" id="askAboutPaperBtn">Hỏi về paper này</button>
+        </div>
+      </div>
+      <div class="pdf-wrap" id="pdfWrap">
+        <div class="empty-view">
+          <div>
+            <h2>Chưa chọn paper</h2>
+            <p class="small">Chọn paper ở cột trái, sau đó dùng trợ lý AI ở cột phải để hỏi theo nội dung tài liệu.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="panel assistant">
+      <div class="header">
+        <p class="eyebrow">AI Assistant</p>
+        <h1>Hỏi đáp theo corpus</h1>
+        <p class="small muted">Trả lời dựa trên retrieval, có citation và nút mở nguồn.</p>
+      </div>
+      <div class="chat-log" id="chatLog">
+        <div class="bubble system">Chọn một paper hoặc nhập câu hỏi. Nếu bật “Giới hạn paper đang mở”, câu hỏi sẽ được gắn thêm tên paper hiện tại để retrieval tập trung hơn.</div>
+      </div>
+      <div class="composer">
+        <textarea id="queryInput" placeholder="Ví dụ: Paper này dùng phương pháp gì? Kết quả chính là gì?"></textarea>
+        <div class="controls">
+          <div>
+            <label class="check"><input id="scopePaper" type="checkbox" checked> Giới hạn paper đang mở</label>
+            <label class="check"><input id="showContext" type="checkbox"> Hiện context</label>
+          </div>
+          <button class="btn primary" id="sendBtn">Gửi</button>
+        </div>
+      </div>
+      <div class="status" id="status">Sẵn sàng.</div>
+    </aside>
+  </main>
+
+  <script>
+    const state = { papers: [], folders: [], filtered: [], selected: null, busy: false };
+
+    const els = {
+      paperList: document.getElementById("paperList"),
+      paperCount: document.getElementById("paperCount"),
+      paperSearch: document.getElementById("paperSearch"),
+      folderCount: document.getElementById("folderCount"),
+      folderName: document.getElementById("folderName"),
+      folderSelect: document.getElementById("folderSelect"),
+      createFolderBtn: document.getElementById("createFolderBtn"),
+      deleteFolderBtn: document.getElementById("deleteFolderBtn"),
+      arxivQuery: document.getElementById("arxivQuery"),
+      arxivSearchBtn: document.getElementById("arxivSearchBtn"),
+      arxivResults: document.getElementById("arxivResults"),
+      deletePaperBtn: document.getElementById("deletePaperBtn"),
+      rebuildIndexBtn: document.getElementById("rebuildIndexBtn"),
+      corpusStatus: document.getElementById("corpusStatus"),
+      viewerTitle: document.getElementById("viewerTitle"),
+      viewerPath: document.getElementById("viewerPath"),
+      viewerCategory: document.getElementById("viewerCategory"),
+      pdfWrap: document.getElementById("pdfWrap"),
+      openNewTabBtn: document.getElementById("openNewTabBtn"),
+      askAboutPaperBtn: document.getElementById("askAboutPaperBtn"),
+      chatLog: document.getElementById("chatLog"),
+      queryInput: document.getElementById("queryInput"),
+      sendBtn: document.getElementById("sendBtn"),
+      scopePaper: document.getElementById("scopePaper"),
+      showContext: document.getElementById("showContext"),
+      status: document.getElementById("status")
+    };
+
+    init();
+
+    async function init() {
+      bindEvents();
+      await loadPapers();
+    }
+
+    function bindEvents() {
+      els.paperSearch.addEventListener("input", renderPaperList);
+      els.createFolderBtn.addEventListener("click", createFolder);
+      els.deleteFolderBtn.addEventListener("click", deleteFolder);
+      els.arxivSearchBtn.addEventListener("click", searchArxiv);
+      els.arxivQuery.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") searchArxiv();
+      });
+      els.deletePaperBtn.addEventListener("click", deleteSelectedPaper);
+      els.rebuildIndexBtn.addEventListener("click", rebuildIndex);
+      els.sendBtn.addEventListener("click", ask);
+      els.queryInput.addEventListener("keydown", (event) => {
+        if ((event.metaKey || event.ctrlKey) && event.key === "Enter") ask();
+      });
+      els.openNewTabBtn.addEventListener("click", () => {
+        if (state.selected) window.open(paperUrl(state.selected.source), "_blank");
+      });
+      els.askAboutPaperBtn.addEventListener("click", () => {
+        if (!state.selected) return;
+        els.queryInput.value = `Tóm tắt mục tiêu, phương pháp và đóng góp chính của paper ${state.selected.paper_id}.`;
+        els.queryInput.focus();
+      });
+    }
+
+    async function loadPapers() {
+      setStatus("Đang tải danh sách paper...");
+      const [papersResponse, foldersResponse] = await Promise.all([fetch("/papers"), fetch("/folders")]);
+      const data = await papersResponse.json();
+      const folderData = await foldersResponse.json();
+      state.papers = data.papers || [];
+      state.folders = folderData.folders || [];
+      state.filtered = state.papers;
+      els.paperCount.textContent = `${state.papers.length} paper trong corpus`;
+      renderFolders();
+      renderPaperList();
+      setStatus("Sẵn sàng.");
+    }
+
+    function renderFolders() {
+      els.folderCount.textContent = `${state.folders.length} thư mục`;
+      els.folderSelect.innerHTML = state.folders.map((name) => `<option value="${escapeAttr(name)}">${escapeHtml(name)}</option>`).join("");
+      if (state.selected && state.folders.includes(state.selected.category)) {
+        els.folderSelect.value = state.selected.category;
+      }
+    }
+
+    function renderPaperList() {
+      const keyword = els.paperSearch.value.trim().toLowerCase();
+      state.filtered = state.papers.filter((paper) => {
+        const haystack = `${paper.paper_id} ${paper.title} ${paper.category} ${paper.filename}`.toLowerCase();
+        return haystack.includes(keyword);
+      });
+      els.paperList.innerHTML = state.filtered.map((paper) => `
+        <button class="paper-item ${state.selected?.source === paper.source ? "active" : ""}" data-source="${escapeAttr(paper.source)}">
+          <div class="paper-title">${escapeHtml(paper.title)}</div>
+          <div class="paper-meta">
+            <span class="tag">${escapeHtml(paper.paper_id)}</span>
+            <span class="tag">${escapeHtml(paper.category)}</span>
+          </div>
+        </button>
+      `).join("");
+      els.paperList.querySelectorAll(".paper-item").forEach((button) => {
+        button.addEventListener("click", () => {
+          const paper = state.papers.find((item) => item.source === button.dataset.source);
+          if (paper) selectPaper(paper);
+        });
+      });
+      els.paperCount.textContent = `${state.filtered.length}/${state.papers.length} paper`;
+    }
+
+    function selectPaper(paper, page = null) {
+      state.selected = paper;
+      els.viewerTitle.textContent = paper.title;
+      els.viewerPath.textContent = paper.source;
+      els.viewerCategory.textContent = `${paper.category} · ${paper.paper_id}`;
+      const suffix = page ? `#page=${encodeURIComponent(page)}` : "";
+      els.pdfWrap.innerHTML = `<iframe class="pdf-frame" src="${paperUrl(paper.source)}${suffix}" title="${escapeAttr(paper.title)}"></iframe>`;
+      renderPaperList();
+      renderFolders();
+      setStatus(`Đang mở ${paper.paper_id}${page ? `, trang ${page}` : ""}.`);
+    }
+
+    async function createFolder() {
+      const name = els.folderName.value.trim();
+      if (!name) return;
+      const data = await postJson("/folders/create", { name });
+      if (data.error) return setCorpusStatus(data.error, true);
+      els.folderName.value = "";
+      state.folders = data.folders || [];
+      renderFolders();
+      setCorpusStatus(`Đã thêm thư mục ${data.folder}.`);
+    }
+
+    async function deleteFolder() {
+      const name = els.folderSelect.value;
+      if (!name || !confirm(`Xóa thư mục rỗng "${name}"?`)) return;
+      const data = await postJson("/folders/delete", { name });
+      if (data.error) return setCorpusStatus(data.error, true);
+      state.folders = data.folders || [];
+      renderFolders();
+      setCorpusStatus(`Đã xóa thư mục ${data.deleted}.`);
+    }
+
+    async function searchArxiv() {
+      const q = els.arxivQuery.value.trim();
+      if (!q) return;
+      setCorpusStatus("Đang tìm trên arXiv...");
+      els.arxivResults.innerHTML = "";
+      const response = await fetch(`/arxiv/search?q=${encodeURIComponent(q)}&max_results=8`);
+      const data = await response.json();
+      if (data.error) {
+        setCorpusStatus(data.error, true);
+        return;
+      }
+      renderArxivResults(data.papers || []);
+      setCorpusStatus(`Tìm thấy ${(data.papers || []).length} paper trên arXiv.`);
+    }
+
+    function renderArxivResults(results) {
+      els.arxivResults.innerHTML = results.map((paper, index) => `
+        <div class="arxiv-card">
+          <b>${escapeHtml(paper.title)}</b>
+          <p>${escapeHtml(paper.arxiv_id)} · ${escapeHtml(paper.published || "")} · ${escapeHtml(paper.primary_category || "")}</p>
+          <p>${escapeHtml((paper.summary || "").slice(0, 170))}${(paper.summary || "").length > 170 ? "..." : ""}</p>
+          <div class="arxiv-actions">
+            <select class="tool-select" data-folder="${index}">
+              ${state.folders.map((name) => `<option value="${escapeAttr(name)}">${escapeHtml(name)}</option>`).join("")}
+            </select>
+            <button class="mini-btn primary" data-download="${index}">Tải PDF</button>
+          </div>
+        </div>
+      `).join("");
+      els.arxivResults.querySelectorAll("[data-download]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const index = Number(button.dataset.download);
+          const select = els.arxivResults.querySelector(`[data-folder="${index}"]`);
+          downloadArxiv(results[index], select?.value || state.folders[0] || "arxiv");
+        });
+      });
+    }
+
+    async function downloadArxiv(paper, category) {
+      setCorpusStatus(`Đang tải ${paper.arxiv_id}...`);
+      const data = await postJson("/papers/download", {
+        arxiv_id: paper.arxiv_id,
+        title: paper.title,
+        category,
+        pdf_url: paper.pdf_url
+      });
+      if (data.error) return setCorpusStatus(data.error, true);
+      await loadPapers();
+      selectPaper(data.paper);
+      setCorpusStatus(`Đã tải ${data.paper.paper_id}. Bấm "Vectorize lại" để đưa vào search.`);
+    }
+
+    async function deleteSelectedPaper() {
+      if (!state.selected) return setCorpusStatus("Chưa chọn paper để xóa.", true);
+      if (!confirm(`Xóa PDF "${state.selected.filename}" khỏi corpus?`)) return;
+      const source = state.selected.source;
+      const data = await postJson("/papers/delete", { source });
+      if (data.error) return setCorpusStatus(data.error, true);
+      state.selected = null;
+      await loadPapers();
+      els.viewerTitle.textContent = "Chọn một paper để đọc";
+      els.viewerPath.textContent = "PDF sẽ được mở ở khu vực này.";
+      els.viewerCategory.textContent = "Paper Viewer";
+      els.pdfWrap.innerHTML = `<div class="empty-view"><div><h2>Chưa chọn paper</h2><p class="small">Paper đã bị xóa. Bấm vectorize lại để cập nhật index.</p></div></div>`;
+      setCorpusStatus("Đã xóa paper. Bấm \"Vectorize lại\" để cập nhật index.");
+    }
+
+    async function rebuildIndex() {
+      if (!confirm("Vectorize lại toàn bộ thư mục papers? Việc này có thể mất một lúc.")) return;
+      setCorpusStatus("Đang vectorize lại corpus...");
+      els.rebuildIndexBtn.disabled = true;
+      els.rebuildIndexBtn.textContent = "Đang chạy";
+      const data = await postJson("/index/rebuild", {});
+      els.rebuildIndexBtn.disabled = false;
+      els.rebuildIndexBtn.textContent = "Vectorize lại";
+      if (data.error) return setCorpusStatus(data.error, true);
+      await loadPapers();
+      setCorpusStatus(`Vectorize xong: ${data.num_chunks} chunks, ${Number(data.elapsed_sec || 0).toFixed(1)}s.`);
+    }
+
+    async function ask() {
+      if (state.busy) return;
+      const raw = els.queryInput.value.trim();
+      if (!raw) return;
+      const scoped = state.selected && els.scopePaper.checked;
+      const query = scoped ? `${raw}\n\nChỉ ưu tiên paper: ${state.selected.paper_id} ${state.selected.title}` : raw;
+      appendBubble("user", raw);
+      els.queryInput.value = "";
+      setBusy(true, "Đang truy xuất và sinh câu trả lời...");
+
+      try {
+        const response = await fetch("/query", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            query,
+            answer: true,
+            show_context: els.showContext.checked,
+            use_llm: false,
+            final_k: 5,
+            source: scoped ? state.selected.source : ""
+          })
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+        appendAnswer(data);
+        setStatus("Hoàn tất.");
+      } catch (error) {
+        appendBubble("system", `Lỗi: ${error.message}`);
+        setStatus("Có lỗi khi truy vấn.");
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    function appendAnswer(data) {
+      const answer = data.answer || "Không có answer. Hãy thử bật Ollama hoặc hỏi cụ thể hơn.";
+      const wrapper = document.createElement("div");
+      wrapper.className = "bubble system";
+      wrapper.innerHTML = `<div>${escapeHtml(answer)}</div>`;
+      const results = data.results || [];
+      if (results.length) {
+        const list = document.createElement("div");
+        list.innerHTML = results.map((item) => `
+          <div class="result-card">
+            <div><b>#${item.rank}</b> score=${fmt(item.score)} · ${escapeHtml(item.paper || "unknown paper")}</div>
+            <div class="small muted">${escapeHtml(item.citation || "")}</div>
+            <div class="small" style="margin-top:6px">${escapeHtml((item.context || item.text || "").slice(0, 360))}${(item.context || item.text || "").length > 360 ? "..." : ""}</div>
+            <button data-source="${escapeAttr(item.source || "")}" data-page="${escapeAttr(item.page || "")}">Mở nguồn</button>
+          </div>
+        `).join("");
+        list.querySelectorAll("button").forEach((button) => {
+          button.addEventListener("click", () => openResult(button.dataset.source, button.dataset.page));
+        });
+        wrapper.appendChild(list);
+      }
+      els.chatLog.appendChild(wrapper);
+      els.chatLog.scrollTop = els.chatLog.scrollHeight;
+    }
+
+    function openResult(source, page) {
+      const paper = state.papers.find((item) => item.source === source);
+      if (paper) selectPaper(paper, page || null);
+      else if (source) window.open(paperUrl(source), "_blank");
+    }
+
+    function appendBubble(kind, text) {
+      const div = document.createElement("div");
+      div.className = `bubble ${kind}`;
+      div.textContent = text;
+      els.chatLog.appendChild(div);
+      els.chatLog.scrollTop = els.chatLog.scrollHeight;
+    }
+
+    function setBusy(busy, message = "Sẵn sàng.") {
+      state.busy = busy;
+      els.sendBtn.disabled = busy;
+      els.sendBtn.innerHTML = busy ? `<span class="spinner"></span>Đang chạy` : "Gửi";
+      setStatus(message);
+    }
+
+    function setStatus(text) { els.status.textContent = text; }
+    function setCorpusStatus(text, error = false) {
+      els.corpusStatus.textContent = text;
+      els.corpusStatus.style.color = error ? "#be123c" : "#64748b";
+    }
+    async function postJson(url, payload) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload)
+      });
+      return response.json();
+    }
+    function paperUrl(source) { return `/paper?source=${encodeURIComponent(source)}`; }
+    function fmt(value) { return Number.isFinite(Number(value)) ? Number(value).toFixed(4) : "n/a"; }
+    function escapeHtml(text) {
+      return String(text ?? "").replace(/[&<>"']/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
+    }
+    function escapeAttr(text) { return escapeHtml(text).replace(/`/g, "&#96;"); }
+  </script>
+</body>
+</html>

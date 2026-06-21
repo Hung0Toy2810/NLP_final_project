@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 from retrieval_system.indexing.encoder import SFTBEEncoder
 from retrieval_system.llm.ollama_client import OllamaClient
 from retrieval_system.llm.verifier import rerank_with_llm
@@ -76,6 +78,72 @@ class RetrievalPipeline:
         candidates = self.store.search(query_vector, top_k=vector_top_k)
         if not candidates:
             return []
+        _apply_lexical_boost(query, candidates)
+        candidates.sort(
+            key=lambda item: item.final_score if item.final_score is not None else item.vector_score,
+            reverse=True,
+        )
+
+        if self.cross_encoder is not None:
+            candidates = self.cross_encoder.rerank(
+                query,
+                candidates,
+                top_k=cross_rerank_k,
+            )
+        else:
+            candidates = candidates[: max(1, min(cross_rerank_k, len(candidates)))]
+
+        rerank_input = candidates[: max(1, min(llm_rerank_k, len(candidates)))]
+        if use_llm and self.llm_client is not None:
+            try:
+                reranked = rerank_with_llm(
+                    query,
+                    rerank_input,
+                    context_provider=self.context_for_result,
+                    client=self.llm_client,
+                )
+                remaining = candidates[len(rerank_input) :]
+                results = reranked + remaining
+            except RuntimeError as exc:
+                results = candidates
+                for item in results:
+                    item.reason = f"LLM verifier unavailable: {exc}"
+        else:
+            results = candidates
+
+        results.sort(
+            key=lambda item: item.final_score if item.final_score is not None else item.vector_score,
+            reverse=True,
+        )
+        return results[: max(1, final_k)]
+
+    def retrieve_in_source(
+        self,
+        query: str,
+        source: str,
+        vector_top_k: int = 100,
+        cross_rerank_k: int = 10,
+        llm_rerank_k: int = 8,
+        final_k: int = 5,
+        use_llm: bool = True,
+    ) -> list[SearchResult]:
+        if self.store.vectors is None:
+            self.store.load()
+        assert self.store.vectors is not None
+
+        query_vector = self.encoder.encode_one(query).astype(np.float32, copy=False)
+        candidates: list[SearchResult] = []
+        for idx, chunk in enumerate(self.store.chunks):
+            if chunk.source != source:
+                continue
+            score = float(self.store.vectors[idx] @ query_vector)
+            candidates.append(SearchResult(chunk=chunk, vector_score=score))
+
+        if not candidates:
+            return []
+
+        candidates.sort(key=lambda item: item.vector_score, reverse=True)
+        candidates = candidates[: max(1, min(vector_top_k, len(candidates)))]
         _apply_lexical_boost(query, candidates)
         candidates.sort(
             key=lambda item: item.final_score if item.final_score is not None else item.vector_score,
